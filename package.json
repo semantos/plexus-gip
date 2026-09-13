@@ -1,0 +1,23 @@
+{
+  "name": "gip-v2-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Genealogical Identity Protocol v2 — self-contained runnable kit (Plexus identity + Semantos graph, carved from semantos-core)",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "walkthrough": "bun walkthrough.ts",
+    "cli": "bun cli.ts",
+    "portal:demo": "bun portal/demo.ts",
+    "portal:server": "bun portal/server.ts",
+    "familysearch:demo": "bun familysearch/demo.ts",
+    "delegation:demo": "bun delegation-demo.ts"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "~5.8.0"
+  }
+}
