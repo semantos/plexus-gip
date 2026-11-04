@@ -62,6 +62,22 @@ Because the production node key (`deriveOrgNodeSk`) is a *keyed* child of the or
 tier-0 (deliberately unlinkable), the relationship can't be derived from public keys
 — so it's proven by a **signed delegation**, not a derivation check.
 
+## Any body as attestor (`src/bodies/`)
+
+A school, club, scout group, parish, sports club, employer or professional body
+confirms one fact about a member from its own records (`member`,
+`guardian_of_member`, `age_over_13/16/18` or `helper`) and signs a W3C VC 2.0
+credential, an ES256K JWT, about a did:key the member's wallet made for one
+platform only. No name, birthdate or record number goes in it. The platform
+checks it offline: the holder's answer to its challenge, the body's entry in a
+steward-signed registry, the node's delegation from the body's anchor, and the
+body's withdrawal list. See [`docs/GIP-V2-BODY-ATTESTATION.md`](docs/GIP-V2-BODY-ATTESTATION.md).
+
+```bash
+bun bodies/demo.ts   # a school, then a scout group, through the same code
+bun test             # every refusal, the known-answer file, the ported wire formats
+```
+
 ## Paid-attestation portal (prototype)
 
 FamilySearch can **charge to issue** an attestation over an x402-style `402`
@@ -142,5 +158,5 @@ The `docs/` folder carries the "why", not just the "how":
   protocol, for reading and running.
 - The `src/` modules are carved copies from semantos-core (the Plexus/Semantos
   monorepo); the kit-specific pieces are this README, the `src/index.ts` barrel,
-  `walkthrough.ts`, `cli.ts`, `sign.ts`, `delegation-demo.ts`, and the `portal/`
-  and `familysearch/` entry points.
+  `walkthrough.ts`, `cli.ts`, `sign.ts`, `delegation-demo.ts`, the `portal/`
+  and `familysearch/` entry points, and `src/bodies/` with `bodies/demo.ts`.
