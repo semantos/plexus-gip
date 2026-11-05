@@ -5,7 +5,11 @@
  *     bun bodies/office/cli.ts init --did did:web:<host> --anchor-key <file> --entry <file>
  *     bun bodies/office/cli.ts init --did did:web:<host> --anchor-key <file> \
  *         --steward-key <file> --kind school --period-ends 2026-12-31T23:59:59Z,2027-12-31T23:59:59Z
- *     bun bodies/office/cli.ts serve [--port 8080] [--host 127.0.0.1] [--desk-origin <origin>[,<origin>]]
+ *     bun bodies/office/cli.ts serve [--desk-auth brain|dev-token] [--port 8080] [--host 127.0.0.1]
+ *         [--unix <socket>] [--desk-origin <origin>[,<origin>]]
+ *     bun bodies/office/cli.ts registrars add <cert id> [--label <name>]
+ *     bun bodies/office/cli.ts registrars remove <cert id>
+ *     bun bodies/office/cli.ts registrars list
  *     bun bodies/office/cli.ts token
  *     bun bodies/office/cli.ts rotate-node --anchor-key <file>
  *     bun bodies/office/cli.ts retire-node <node>
@@ -13,9 +17,18 @@
  * Every command but keygen takes `--state <file>`, by default $OFFICE_STATE or
  * `.gip-v2/office.json`. `init` also takes `--url <origin>` when the office is
  * not at the did:web's host, and `--claims` (default member,guardian_of_member).
- * `serve` takes `--desk-origin`, by default $OFFICE_DESK_ORIGIN: the origins a
- * browser may reach the desk routes from, such as the brain that serves the
- * registrar's Helm. The token is still required from them.
+ * `serve` takes `--desk-auth`, by default $OFFICE_DESK_AUTH or `dev-token`:
+ * `brain` for a deploy, where the registrar signs in to the brain and Caddy
+ * passes the brain's answer on (http.ts); `dev-token` for development only,
+ * with the token `init` printed. Behind the brain the office listens on
+ * loopback (`--host`) or a unix socket (`--unix`, mode 0660). `--desk-origin`,
+ * by default $OFFICE_DESK_ORIGIN, names the origins a browser may reach the
+ * desk routes from when the Helm is not served by the brain itself.
+ *
+ * `registrars` keeps the members who may use the desk behind the brain,
+ * besides the brain's operator, by the cert id the brain names for them (the
+ * desk's Setup shows a member theirs). Taking one off refuses their next
+ * request.
  *
  * The anchor key file is read once, to sign the node's delegation, and is not
  * copied into the state. Keep it offline after init, and bring it out again
@@ -30,15 +43,21 @@ import { dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 import { PrivateKey } from '@bsv/sdk';
 import type { BodyClaim, BodyKind } from '../../src';
-import { deskOrigin, serveOffice } from './http';
-import { Office } from './office';
+import { type DeskAuth, deskAuth, deskOrigin, serveOffice } from './http';
+import { Office, OfficeError } from './office';
 import { fileStore, initState } from './state';
 
 const HELP = `commands:
   keygen <file>         make a key file (an anchor, or a pilot's steward), mode 600
   init                  make the office: --did --anchor-key, and --entry or --steward-key
-  serve                 run it: --port (8080) --host (127.0.0.1) --desk-origin (the desk's origins, comma separated)
-  token                 make a new registrar token; the old one stops working
+  serve                 run it: --desk-auth (brain, or dev-token for development) --port (8080) --host (127.0.0.1)
+                        --unix (a socket instead of a port) --desk-origin (the desk's origins, comma separated)
+  registrars add <cert id> [--label <name>]
+                        let a member use the desk behind the brain, by the cert id the brain names for them
+  registrars remove <cert id>
+                        stop them: their next desk request is refused
+  registrars list       who may use the desk, besides the brain's operator
+  token                 make a new development token (dev-token mode); the old one stops working
   rotate-node           make a new signing node: --anchor-key; the old one stays honoured until retired
   retire-node <node>    stop honouring an old node: every vouch it signed then fails
 options: --state <file> (default $OFFICE_STATE or .gip-v2/office.json)`;
@@ -111,8 +130,9 @@ function init(v: Record<string, string | undefined>, statePath: string): void {
   console.log(`  node           ${info.node}   (delegated for body.vouch)`);
   console.log(`  steward        ${info.steward}   (apps put this in their trusted set)`);
   console.log(`  may vouch      ${info.claims.join(', ')}, ending ${info.periodEnds.join(', ')}`);
-  console.log('registrar token (shown once; keep it safe):');
+  console.log('registrar token, for --desk-auth dev-token, development only (shown once; keep it safe):');
   console.log(`  ${made.token}`);
+  console.log('behind the brain, add registrars with: registrars add <cert id>');
   if (info.pilotSteward) console.error(STEWARD_WARNING);
 }
 
@@ -120,6 +140,12 @@ function serve(v: Record<string, string | undefined>, statePath: string): void {
   const office = new Office(fileStore(statePath));
   const info = office.info();
   if (info.pilotSteward) console.error(STEWARD_WARNING);
+  let mode: DeskAuth;
+  try {
+    mode = deskAuth(v['desk-auth'] ?? process.env.OFFICE_DESK_AUTH ?? 'dev-token');
+  } catch (e) {
+    fail(`--desk-auth: ${(e as OfficeError).detail}`);
+  }
   const port = Number(v.port ?? 8080);
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail('--port is a port number');
   const origins = (v['desk-origin'] ?? process.env.OFFICE_DESK_ORIGIN ?? '')
@@ -133,15 +159,53 @@ function serve(v: Record<string, string | undefined>, statePath: string): void {
       fail(`--desk-origin: ${(e as Error).message}`);
     }
   }
-  const server = serveOffice(office, { port, hostname: v.host, deskOrigins: origins });
-  console.log(`office for ${info.did} listening on http://${server.hostname}:${server.port}`);
-  console.log(`  reached at ${info.baseUrl}: put TLS in front, the registrar token is a bearer secret`);
+  if (v.unix !== undefined && v.host !== undefined) fail('give --unix or --host, not both');
+  let server: ReturnType<typeof serveOffice>;
+  try {
+    server =
+      v.unix !== undefined
+        ? serveOffice(office, { unix: v.unix, deskOrigins: origins, deskAuth: mode })
+        : serveOffice(office, { port, hostname: v.host, deskOrigins: origins, deskAuth: mode });
+  } catch (e) {
+    fail(e instanceof OfficeError ? `${e.code}: ${e.detail}` : (e as Error).message);
+  }
+  console.log(`office for ${info.did} listening on ${v.unix !== undefined ? `unix:${v.unix}` : `http://${server.hostname}:${server.port}`}`);
+  console.log(`  reached at ${info.baseUrl}: put TLS in front, a pickup code is a secret until it is used`);
+  if (mode === 'brain') {
+    const n = office.registrars().length;
+    console.log(`  desk auth brain: the brain's operator, and ${n} ${n === 1 ? 'registrar' : 'registrars'}, through Caddy on the brain's host`);
+  } else {
+    console.error('  desk auth dev-token: DEVELOPMENT ONLY. Anyone with the token is the registrar. Deploy with --desk-auth brain.');
+  }
   console.log(origins.length === 0 ? '  desk from no other origin (--desk-origin to add one)' : `  desk from ${origins.join(', ')}`);
+}
+
+function registrars(sub: string | undefined, certId: string | undefined, v: Record<string, string | undefined>, statePath: string): void {
+  const office = new Office(fileStore(statePath));
+  if (sub === 'list') {
+    const list = office.registrars();
+    if (list.length === 0) console.log('no registrars: only the brain\'s operator may use the desk');
+    for (const r of list) console.log(`${r.certId}  ${r.addedAt}${r.label === undefined ? '' : `  ${r.label}`}`);
+    return;
+  }
+  if (sub !== 'add' && sub !== 'remove') fail('registrars add <cert id> [--label <name>] | remove <cert id> | list');
+  if (certId === undefined) fail(`registrars ${sub} <cert id>`);
+  try {
+    if (sub === 'add') {
+      const r = office.addRegistrar(certId, v.label);
+      console.log(r.added ? `added ${certId}: they may use the desk from their next request` : `${certId} is already a registrar`);
+    } else {
+      office.removeRegistrar(certId);
+      console.log(`removed ${certId}: their next desk request is refused`);
+    }
+  } catch (e) {
+    fail(e instanceof OfficeError ? `${e.code}: ${e.detail}` : (e as Error).message);
+  }
 }
 
 function token(statePath: string): void {
   const t = new Office(fileStore(statePath)).rotateToken();
-  console.log('new registrar token (shown once; the old one no longer works):');
+  console.log('new registrar token, for --desk-auth dev-token, development only (shown once; the old one no longer works):');
   console.log(`  ${t}`);
 }
 
@@ -183,15 +247,19 @@ function main(): void {
       port: { type: 'string' },
       host: { type: 'string' },
       'desk-origin': { type: 'string' },
+      'desk-auth': { type: 'string' },
+      unix: { type: 'string' },
+      label: { type: 'string' },
       help: { type: 'boolean' },
     },
   });
-  const [cmd, arg] = positionals;
+  const [cmd, arg, arg2] = positionals;
   const statePath = values.state ?? process.env.OFFICE_STATE ?? '.gip-v2/office.json';
   const { help, ...v } = values;
   if (cmd === 'keygen') keygen(arg);
   else if (cmd === 'init') init(v, statePath);
   else if (cmd === 'serve') serve(v, statePath);
+  else if (cmd === 'registrars') registrars(arg, arg2, v, statePath);
   else if (cmd === 'token') token(statePath);
   else if (cmd === 'rotate-node') rotateNode(v, statePath);
   else if (cmd === 'retire-node') retireNode(arg, statePath);

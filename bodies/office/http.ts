@@ -9,8 +9,9 @@
  *     POST /pickup/:code {proof}     the vouch, about the key that signed the proof
  *     POST /collect {proof}          every live vouch about the key that signed the proof
  *
- * The registrar's desk, with `Authorization: Bearer <token>`:
+ * The registrar's desk:
  *
+ *     GET  /desk/whoami              who the office takes the caller to be, and whether it lets them in
  *     GET  /desk/roster              every row
  *     POST /desk/roster {rows}       add or update rows
  *     POST /desk/consent {ids, consent}
@@ -19,18 +20,49 @@
  *     GET  /desk/needs               the home list
  *     GET  /desk/standing            the registry entry, the nodes, the withdrawal list
  *
- * The desk is a page on another origin (the Helm, served by the body's
- * brain), so the office answers a browser from the origins it is given
- * (`deskOrigins`) and from no other. That is CORS, not a lock: every desk
- * route still wants the token, whoever asks.
+ * Who may use the desk is the desk auth mode's to say:
+ *
+ * - `brain` (for a deploy). The registrar signs in to the body's brain in the
+ *   Helm. Caddy, on the brain's host, takes `/api/v1/vouch/desk/*`, asks the
+ *   brain who the Helm's bearer belongs to (`forward_auth` to
+ *   `/api/v1/auth/check`), strips whatever identity headers the client sent,
+ *   sets them from the brain's answer, drops the brain's credentials and
+ *   passes the request here as `/desk/*`. The office takes a desk request only
+ *   over loopback or its own unix socket, only with those headers, and only
+ *   from the brain's operator or a member on its registrar list
+ *   (`cli.ts registrars`). A request that still carries an Authorization
+ *   header or a cookie is refused: the brain's credential stops at Caddy.
+ * - `dev-token` (the default, for development only): `Authorization: Bearer
+ *   <token>`, the token `init` printed.
+ *
+ * Every desk action is put down to who made it, in the office's own record.
+ *
+ * The desk may be a page on another origin (a Helm the brain does not
+ * serve), so the office answers a browser from the origins it is given
+ * (`deskOrigins`) and from no other. That is CORS, not a lock.
  *
  * The server speaks plain HTTP on localhost by default. Put TLS in front of
- * it: the token is a bearer secret, and so is a pickup code until it is used.
- * `deploy/` has a systemd unit and a Caddy site for it, beside a brain.
+ * it: a pickup code is a secret until it is used. `deploy/` has a systemd unit
+ * and a Caddy site for it, beside a brain.
  */
-import { Office, OfficeError } from './office';
+import { chmodSync } from 'node:fs';
+import { CERT_ID, Office, OfficeError } from './office';
+import type { DeskActor } from './state';
 
-type Handler = (req: Request) => Promise<Response>;
+/** How the desk knows who is asking: through the brain, or (development only) by the office's own token. */
+export type DeskAuth = 'brain' | 'dev-token';
+
+/** The headers Caddy sets from the brain's answer (`/api/v1/auth/check`), and no one else may. */
+export const STANDING_HEADER = 'x-semantos-standing';
+export const CERT_ID_HEADER = 'x-semantos-cert-id';
+
+/** Every standing the brain names. The desk takes only the operator's and a listed member's. */
+const STANDINGS = new Set(['operator', 'admin', 'member', 'hat', 'device', 'agent']);
+
+/** Where a request came from: an address, or the office's own unix socket. */
+export type Peer = { address: string } | { unix: true };
+
+type Handler = (req: Request, peer?: Peer) => Promise<Response>;
 
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
   new Response(`${JSON.stringify(body, null, 2)}\n`, {
@@ -68,6 +100,7 @@ function only(methods: string[], req: Request): void {
 }
 
 const DESK = new Map<string, string[]>([
+  ['whoami', ['GET']],
   ['roster', ['GET', 'POST']],
   ['consent', ['POST']],
   ['vouch', ['POST']],
@@ -83,9 +116,72 @@ const DESK_READS: Record<string, (office: Office) => unknown> = {
   standing: (office) => office.standing(),
 };
 
-async function desk(office: Office, req: Request, name: string, allowed: (origin: string | null) => boolean): Promise<Response> {
+/** 127.0.0.0/8, ::1, or either as an IPv4-mapped address. */
+export function isLoopback(address: string): boolean {
+  const a = address.toLowerCase().replace(/^::ffff:/, '');
+  if (a === '::1' || a === '0:0:0:0:0:0:0:1') return true;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a);
+  return m !== null && m.slice(1).every((x) => Number(x) <= 255);
+}
+
+/** Who the caller is at the desk, and whether the office lets them in. */
+interface DeskCaller {
+  /** As the brain named it, or `dev-token`. */
+  standing: string;
+  certId?: string;
+  registrar: boolean;
+  /** Why not, when not. */
+  why?: string;
+}
+
+/** A caller the office let in, as its record names them. */
+const actorOf = (c: DeskCaller): DeskActor => ({
+  standing: c.standing as DeskActor['standing'],
+  ...(c.certId !== undefined && { certId: c.certId }),
+});
+
+/**
+ * The caller behind the brain, from the headers Caddy set. Throws when the
+ * request did not come the way Caddy sends it; answers `registrar: false`
+ * for a caller the brain named but the office does not let in.
+ */
+function brainCaller(office: Office, req: Request, peer: Peer | undefined): DeskCaller {
+  if (peer === undefined || (!('unix' in peer) && !isLoopback(peer.address))) {
+    throw new OfficeError(403, 'not_through_the_brain', 'the desk is reached through the brain\'s host, from Caddy on this machine');
+  }
+  if (req.headers.has('authorization') || req.headers.has('cookie')) {
+    throw new OfficeError(400, 'brain_credential_forwarded', 'the brain\'s credentials stop at Caddy: strip Authorization and Cookie before the office');
+  }
+  const standing = req.headers.get(STANDING_HEADER) ?? '';
+  const certId = req.headers.get(CERT_ID_HEADER) ?? '';
+  if (standing === '') throw new OfficeError(401, 'no_identity', 'no caller from the brain: sign in to the brain in the Helm');
+  if (!STANDINGS.has(standing) || (certId !== '' && !CERT_ID.test(certId))) throw new OfficeError(401, 'bad_identity');
+  const who = { standing, ...(certId !== '' && { certId }) };
+  if (standing === 'operator' || standing === 'admin') return { ...who, registrar: true };
+  if (standing !== 'member') return { ...who, registrar: false, why: `signed in with a ${standing}'s bearer: sign in to the brain with your own wallet` };
+  if (certId === '') return { ...who, registrar: false, why: 'your sign-in names no identity: bind your wallet to your identity on the brain' };
+  if (!office.isRegistrar(certId)) return { ...who, registrar: false, why: 'ask the school\'s operator to add you as a registrar' };
+  return { ...who, registrar: true };
+}
+
+/** The caller with the development token. */
+function tokenCaller(office: Office, req: Request): DeskCaller {
+  const token = bearer(req);
+  if (token === null) throw new OfficeError(401, 'no_token');
+  if (token === '' || !office.checkToken(token)) throw new OfficeError(401, 'bad_token');
+  return { standing: 'dev-token', registrar: true };
+}
+
+async function desk(
+  office: Office,
+  req: Request,
+  name: string,
+  allowed: (origin: string | null) => boolean,
+  mode: DeskAuth,
+  peer: Peer | undefined,
+): Promise<Response> {
   if (req.method === 'OPTIONS') {
-    // A browser asks before it sends the token. Only the desk's origins are told yes.
+    // A browser asks before it sends its credential. Only the desk's origins are told yes.
     const origin = req.headers.get('origin');
     if (!allowed(origin)) throw new OfficeError(403, 'origin_not_allowed');
     return new Response(null, {
@@ -98,26 +194,34 @@ async function desk(office: Office, req: Request, name: string, allowed: (origin
     });
   }
   only(DESK.get(name)!, req);
-  const token = bearer(req);
-  if (token === null) throw new OfficeError(401, 'no_token');
-  if (token === '' || !office.checkToken(token)) throw new OfficeError(401, 'bad_token');
+  const caller = mode === 'brain' ? brainCaller(office, req, peer) : tokenCaller(office, req);
+  if (name === 'whoami') return json({ mode, ...caller });
+  if (!caller.registrar) throw new OfficeError(403, 'not_a_registrar', caller.why);
   if (req.method === 'GET') return json(DESK_READS[name]!(office));
   const b = await bodyOf(req);
+  const by = actorOf(caller);
   switch (name) {
     case 'roster':
-      return json({ rows: office.upsertRows(b.rows) });
+      return json({ rows: office.upsertRows(b.rows, by) });
     case 'consent':
-      return json(office.setConsent(b.ids, b.consent));
+      return json(office.setConsent(b.ids, b.consent, by));
     case 'vouch':
-      return json(office.vouch(b.ids, b.periodEnd));
+      return json(office.vouch(b.ids, b.periodEnd, by));
     default:
-      return json(office.withdraw(b.ids, b.sponsorNote));
+      return json(office.withdraw(b.ids, b.sponsorNote, by));
   }
 }
 
-async function route(office: Office, req: Request, path: string, allowed: (origin: string | null) => boolean): Promise<Response> {
+async function route(
+  office: Office,
+  req: Request,
+  path: string,
+  allowed: (origin: string | null) => boolean,
+  mode: DeskAuth,
+  peer: Peer | undefined,
+): Promise<Response> {
   const deskName = /^\/desk\/([a-z]+)$/.exec(path)?.[1];
-  if (deskName !== undefined && DESK.has(deskName)) return desk(office, req, deskName, allowed);
+  if (deskName !== undefined && DESK.has(deskName)) return desk(office, req, deskName, allowed, mode, peer);
 
   if (path.endsWith('/did.json') && path === office.didDocumentPath()) {
     only(['GET'], req);
@@ -155,7 +259,9 @@ function failure(e: unknown): Response {
     return json({ error: 'internal' }, 500);
   }
   const headers: Record<string, string> = {};
-  if (e.status === 401) headers['www-authenticate'] = `Bearer realm="desk"${e.code === 'bad_token' ? ', error="invalid_token"' : ''}`;
+  if (e.status === 401 && (e.code === 'no_token' || e.code === 'bad_token')) {
+    headers['www-authenticate'] = `Bearer realm="desk"${e.code === 'bad_token' ? ', error="invalid_token"' : ''}`;
+  }
   if (e.status === 405 && e.detail !== undefined) headers.allow = e.detail;
   return json({ error: e.code, ...(e.detail !== undefined && { detail: e.detail }) }, e.status, headers);
 }
@@ -171,22 +277,36 @@ export function deskOrigin(origin: string): string {
 
 export interface OfficeHandlerOptions {
   /**
-   * The origins the registrar's desk is served from, such as the body's
-   * brain, which serves the Helm. A browser on one of them may call the desk
-   * routes; it still needs the token. None by default.
+   * The origins the registrar's desk is served from, when that is not the
+   * brain's own host (a Helm the brain does not serve). A browser on one of
+   * them may call the desk routes; it is still asked who it is. None by
+   * default.
    */
   deskOrigins?: readonly string[];
+  /** How the desk knows who is asking. `dev-token` by default, which is for development only. */
+  deskAuth?: DeskAuth;
 }
 
-/** A fetch handler for the office: Bun.serve, a Worker, or a test calling it directly. */
+/** A desk auth mode, from a flag or the environment. */
+export function deskAuth(mode: string): DeskAuth {
+  if (mode !== 'brain' && mode !== 'dev-token') throw new OfficeError(400, 'bad_desk_auth', `the desk auth is brain or dev-token, not ${mode}`);
+  return mode;
+}
+
+/**
+ * A fetch handler for the office: Bun.serve, a Worker, or a test calling it
+ * directly. `peer` is where the request came from; behind the brain, the desk
+ * answers only loopback and the office's own socket.
+ */
 export function officeHandler(office: Office, o: OfficeHandlerOptions = {}): Handler {
   const origins = new Set((o.deskOrigins ?? []).map(deskOrigin));
   const allowed = (origin: string | null) => origin !== null && origins.has(origin);
-  return async (req) => {
+  const mode = deskAuth(o.deskAuth ?? 'dev-token');
+  return async (req, peer) => {
     const path = new URL(req.url).pathname;
     let res: Response;
     try {
-      res = await route(office, req, path, allowed);
+      res = await route(office, req, path, allowed, mode, peer);
     } catch (e) {
       res = failure(e);
     }
@@ -205,15 +325,37 @@ export function officeHandler(office: Office, o: OfficeHandlerOptions = {}): Han
 
 export interface ServeOptions extends OfficeHandlerOptions {
   port: number;
-  /** Defaults to 127.0.0.1: put TLS in front. */
+  /** Defaults to 127.0.0.1: put TLS in front. Behind the brain, it must be a loopback address. */
   hostname?: string;
 }
 
-export function serveOffice(office: Office, o: ServeOptions) {
+export interface ServeUnixOptions extends OfficeHandlerOptions {
+  /** A unix socket to listen on instead of a port, made mode 0660: only its owner and group connect. */
+  unix: string;
+}
+
+export function serveOffice(office: Office, o: ServeOptions | ServeUnixOptions) {
+  const handler = officeHandler(office, o);
+  if ('unix' in o) {
+    const server = Bun.serve({
+      unix: o.unix,
+      maxRequestBodySize: 1 << 20,
+      fetch: (req) => handler(req, { unix: true }),
+    });
+    chmodSync(o.unix, 0o660);
+    return server;
+  }
+  const hostname = o.hostname ?? '127.0.0.1';
+  if (o.deskAuth === 'brain' && !isLoopback(hostname) && hostname !== 'localhost') {
+    throw new OfficeError(400, 'not_loopback', `behind the brain the office listens on loopback or a unix socket, not ${hostname}`);
+  }
   return Bun.serve({
     port: o.port,
-    hostname: o.hostname ?? '127.0.0.1',
+    hostname,
     maxRequestBodySize: 1 << 20,
-    fetch: officeHandler(office, o),
+    fetch: (req, server) => {
+      const ip = server.requestIP(req);
+      return handler(req, ip === null ? undefined : { address: ip.address });
+    },
   });
 }
