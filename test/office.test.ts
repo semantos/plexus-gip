@@ -397,6 +397,49 @@ describe('the pilot, end to end', () => {
     expect(needs.json.consentWithdrawn.map((i: any) => i.id)).toEqual(['HP-G-0042b']);
   });
 
+  test('a new node: the anchor delegates it, it signs the list, which carries both delegations', async () => {
+    const old = o.office.info();
+    expect(old.nodes).toEqual([old.node]);
+    const r = o.office.rotateNode(anchor);
+    expect(r.node).not.toBe(old.node);
+    expect(r.nodes).toEqual([r.node, old.node]);
+    expect(o.office.info()).toMatchObject({ node: r.node, nodes: [r.node, old.node] });
+
+    const list = await o.pub('GET', '/status/1');
+    expect(list.text).not.toBe(listJwt);
+    expect(verifyJwtByKid(list.text)?.signer).toBe(didKeyOf(r.node));
+    expect(payloadOf(list.text).evidence.map((e: any) => readDelegation(e.delegation))).toEqual(
+      [r.node, old.node].map((node) => ({ anchor: anchor.toPublicKey().toString(), node, purpose: 'body.vouch' })),
+    );
+    // The withdrawals carry over, and the old node's vouches still pass.
+    expect(admit(creds.mia!, holder('mia'), entryJwt, list.text, 'member')).toEqual({ ok: false, reason: 'withdrawn' });
+    expect(admit(creds.theo!, holder('theo'), entryJwt, list.text, 'member')).toMatchObject({ ok: true });
+    expect(admit(creds.sam!, holder('sam'), entryJwt, list.text, 'guardian_of_member')).toMatchObject({ ok: true });
+
+    // A vouch collected now is the new node's.
+    const v = await o.desk('POST', '/desk/vouch', { ids: ['HP-0043'] });
+    const got = await redeem(codeOf(v.json.pickups[0].url), holder('theo'));
+    expect(got.status).toBe(200);
+    creds.theoNew = got.json.credential;
+    expect(verifyJwtByKid(creds.theoNew!)?.signer).toBe(didKeyOf(r.node));
+    expect(admit(creds.theoNew!, holder('theo'), entryJwt, list.text, 'member')).toMatchObject({ ok: true });
+    listJwt = list.text;
+  });
+
+  test('retiring the old node: the list drops its delegation, its vouches fail, the new node\'s pass', async () => {
+    const [current, old] = o.office.info().nodes;
+    const r = o.office.retireNode(old!);
+    expect(r).toEqual({ retired: old, nodes: [current] });
+    const list = await o.pub('GET', '/status/1');
+    expect(list.text).not.toBe(listJwt);
+    expect(payloadOf(list.text).evidence.map((e: any) => readDelegation(e.delegation)?.node)).toEqual([current]);
+    expect(admit(creds.theo!, holder('theo'), entryJwt, list.text, 'member')).toEqual({ ok: false, reason: 'node_not_delegated' });
+    expect(admit(creds.sam!, holder('sam'), entryJwt, list.text, 'guardian_of_member')).toEqual({ ok: false, reason: 'node_not_delegated' });
+    expect(admit(creds.theoNew!, holder('theo'), entryJwt, list.text, 'member')).toMatchObject({ ok: true });
+    // Until the app downloads the list again, the old one still honours the node.
+    expect(admit(creds.theo!, holder('theo'), entryJwt, listJwt, 'member')).toMatchObject({ ok: true });
+  });
+
   test('the DID document lists the anchor as a secp256k1 key', async () => {
     const r = await o.pub('GET', '/.well-known/did.json');
     expect(r.status).toBe(200);
@@ -648,6 +691,41 @@ describe('the state file', () => {
   });
 });
 
+describe('nodes', () => {
+  test('a key that is not the anchor makes no new node, and changes nothing', () => {
+    const o = makeOffice('rotate-wrong');
+    const before = readFileSync(o.path, 'utf8');
+    expect(() => o.office.rotateNode(key('other-anchor'))).toThrow('wrong_anchor');
+    expect(readFileSync(o.path, 'utf8')).toBe(before);
+  });
+
+  test('the current node cannot be retired, nor a node not honoured', () => {
+    const o = makeOffice('retire-refusals');
+    const first = o.office.info().node;
+    expect(() => o.office.retireNode(first)).toThrow('current_node');
+    const { node } = o.office.rotateNode(anchor);
+    expect(() => o.office.retireNode(node)).toThrow('current_node');
+    expect(() => o.office.retireNode(key('stranger').toPublicKey().toString())).toThrow('unknown_node');
+    expect(() => o.office.retireNode('not-a-key')).toThrow('unknown_node');
+    expect(o.office.retireNode(first).nodes).toEqual([node]);
+    expect(() => o.office.retireNode(first)).toThrow('unknown_node');
+  });
+
+  test('two rotations honour all three nodes until each is retired; the anchor key is not kept', () => {
+    const o = makeOffice('rotate-twice');
+    const a = o.office.info().node;
+    const b = o.office.rotateNode(anchor).node;
+    const c = o.office.rotateNode(anchor).node;
+    expect(o.office.info().nodes).toEqual([c, b, a]);
+    expect(o.office.retireNode(a).nodes).toEqual([c, b]);
+    expect(o.office.retireNode(b).nodes).toEqual([c]);
+    const s = JSON.parse(readFileSync(o.path, 'utf8'));
+    expect(s.delegations).toHaveLength(1);
+    expect(JSON.stringify(s)).not.toContain(anchor.toHex());
+    expect(verifyJwtByKid(s.statusList)?.signer).toBe(didKeyOf(c));
+  });
+});
+
 describe('the server', () => {
   test('answers over HTTP', async () => {
     const o = makeOffice('server');
@@ -732,5 +810,49 @@ describe('the CLI', () => {
     expect(run.code).toBe(0);
     expect(run.err).not.toContain('MUST NOT STEWARD');
     expect(JSON.parse(readFileSync(state, 'utf8')).registryEntry).toBe(made.registryEntry);
+  });
+
+  test('rotate-node with the anchor key file, then retire-node for the old node', () => {
+    const anchorFile = join(dir, 'cli3-anchor.key');
+    const otherFile = join(dir, 'cli3-other.key');
+    writeFileSync(anchorFile, anchor.toHex(), { mode: 0o600 });
+    writeFileSync(otherFile, key('other-anchor').toHex(), { mode: 0o600 });
+    const { state: made } = initState({
+      did: DID,
+      anchorSk: anchor,
+      stewardSk: steward,
+      kind: 'school',
+      claims: ['member', 'guardian_of_member'],
+      periodEnds: ends.split(','),
+      now: Math.floor(Date.now() / 1000),
+    });
+    const state = join(dir, 'cli3-office.json');
+    fileStore(state).save(made);
+    const old = new Office(fileStore(state)).info().node;
+
+    expect(cli('rotate-node', '--state', state).code).not.toBe(0);
+    const wrong = cli('rotate-node', '--state', state, '--anchor-key', otherFile);
+    expect(wrong.code).not.toBe(0);
+    expect(wrong.err).toContain('wrong_anchor');
+
+    const run = cli('rotate-node', '--state', state, '--anchor-key', anchorFile);
+    expect(run.code).toBe(0);
+    const info = new Office(fileStore(state)).info();
+    expect(info.node).not.toBe(old);
+    expect(info.nodes).toEqual([info.node, old]);
+    expect(run.out).toContain(info.node);
+    expect(run.out).toContain(`retire-node ${old}`);
+    expect(readFileSync(state, 'utf8')).not.toContain(anchor.toHex());
+
+    const none = cli('retire-node', '--state', state);
+    expect(none.code).not.toBe(0);
+    expect(none.err).toContain(old);
+    const current = cli('retire-node', '--state', state, info.node);
+    expect(current.code).not.toBe(0);
+    expect(current.err).toContain('current_node');
+    const retire = cli('retire-node', '--state', state, old);
+    expect(retire.code).toBe(0);
+    expect(retire.out).toContain('node_not_delegated');
+    expect(new Office(fileStore(state)).info().nodes).toEqual([info.node]);
   });
 });

@@ -6,6 +6,9 @@
  * at the office. Their app proves a key it made for one relationship and
  * collects a vouch about that key: one claim, no name. Withdrawing a row sets
  * its bits in the body's withdrawal list, and the node signs the list again.
+ * The list also carries the anchor's delegation of each node the body
+ * honours: a new node is added beside the old, and retiring the old one takes
+ * its delegation off, so every vouch it signed stops passing.
  *
  * Names never leave. A public answer carries the body, the claim and the
  * dates, and nothing from the roster: no label, no group, no roster id.
@@ -13,6 +16,7 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { PrivateKey } from '@bsv/sdk';
 import {
+  BODY_VOUCH_PURPOSE,
   type BodyClaim,
   type BodyKind,
   PRESENTATION_MAX_SKEW,
@@ -20,11 +24,13 @@ import {
   STATUS_LIST_BITS,
   WireError,
   b64url,
+  delegateSigner,
   didKeyOf,
   isoSeconds,
   issueStatusList,
   issueVouch,
   parseIsoSeconds,
+  readDelegation,
   readRegistryEntry,
   signJwt,
   verifyJwtByKid,
@@ -118,7 +124,10 @@ export interface OfficeInfo {
   /** Where the DID document must be found for the did:web to resolve. */
   didDocument: string;
   anchor: string;
+  /** The node that signs, compressed hex. */
   node: string;
+  /** Every node the withdrawal list honours, the signing node first. */
+  nodes: string[];
   steward: string;
   kind: BodyKind;
   claims: readonly BodyClaim[];
@@ -288,6 +297,15 @@ export class Office {
     return PrivateKey.fromString(s.nodeKey, 16);
   }
 
+  /** The nodes the delegations name, compressed hex, in the state's order. */
+  private honoured(s: OfficeState): string[] {
+    return s.delegations.map((d) => {
+      const info = readDelegation(d);
+      if (info === null) throw new OfficeError(500, 'bad_state', 'a delegation does not verify');
+      return info.node;
+    });
+  }
+
   /** Sign the withdrawal list again, from the vouches withdrawn and the delegations honoured. */
   private resign(s: OfficeState, now: number): void {
     const revoked = s.vouches.filter((v) => v.withdrawnAt !== undefined).map((v) => v.statusIndex);
@@ -309,6 +327,7 @@ export class Office {
         didDocument: `${didWebOrigin(s.did)}${didWebPath(s.did)}`,
         anchor: s.anchor,
         node: this.node(s).toPublicKey().toString(),
+        nodes: this.honoured(s),
         steward: e.steward,
         kind: e.kind,
         claims: e.claims,
@@ -444,6 +463,43 @@ export class Office {
       s.tokenHash = hashToken(token);
     });
     return token;
+  }
+
+  /**
+   * A new signing node. The anchor delegates it and it signs the list from
+   * now on. The nodes before it stay on the list, so their vouches still
+   * pass, until each is retired. The anchor key is used here and not kept.
+   */
+  rotateNode(anchorSk: PrivateKey): { node: string; nodes: string[] } {
+    return this.write((s, now) => {
+      if (anchorSk.toPublicKey().toString() !== s.anchor) {
+        throw new OfficeError(400, 'wrong_anchor', 'that key is not the anchor the registry entry names');
+      }
+      const node = PrivateKey.fromRandom();
+      const pub = node.toPublicKey().toString();
+      s.nodeKey = node.toHex();
+      s.delegations = [delegateSigner(anchorSk, pub, BODY_VOUCH_PURPOSE), ...s.delegations];
+      this.resign(s, now);
+      return { node: pub, nodes: this.honoured(s) };
+    });
+  }
+
+  /**
+   * Stop honouring an older node: take its delegation off the list and sign
+   * the list again. Every vouch that node signed fails at the gate, as
+   * node_not_delegated, once the app downloads the list again.
+   */
+  retireNode(node: string): { retired: string; nodes: string[] } {
+    return this.write((s, now) => {
+      if (node === this.node(s).toPublicKey().toString()) {
+        throw new OfficeError(409, 'current_node', 'this node signs the list; make a new node first');
+      }
+      const i = this.honoured(s).indexOf(node);
+      if (i < 0) throw new OfficeError(404, 'unknown_node', `${node} is not on the list`);
+      s.delegations.splice(i, 1);
+      this.resign(s, now);
+      return { retired: node, nodes: this.honoured(s) };
+    });
   }
 
   rows(): RosterRow[] {

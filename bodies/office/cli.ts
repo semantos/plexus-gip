@@ -7,13 +7,20 @@
  *         --steward-key <file> --kind school --period-ends 2026-12-31T23:59:59Z,2027-12-31T23:59:59Z
  *     bun bodies/office/cli.ts serve [--port 8080] [--host 127.0.0.1]
  *     bun bodies/office/cli.ts token
+ *     bun bodies/office/cli.ts rotate-node --anchor-key <file>
+ *     bun bodies/office/cli.ts retire-node <node>
  *
  * Every command but keygen takes `--state <file>`, by default $OFFICE_STATE or
  * `.gip-v2/office.json`. `init` also takes `--url <origin>` when the office is
  * not at the did:web's host, and `--claims` (default member,guardian_of_member).
  *
  * The anchor key file is read once, to sign the node's delegation, and is not
- * copied into the state. Keep it offline after init.
+ * copied into the state. Keep it offline after init, and bring it out again
+ * only for rotate-node.
+ *
+ * rotate-node makes a new node key; the withdrawal list carries both nodes'
+ * delegations, so vouches from either pass. retire-node drops an old node's
+ * delegation from the list: every vouch it signed then fails at the gate.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -29,6 +36,8 @@ const HELP = `commands:
   init                  make the office: --did --anchor-key, and --entry or --steward-key
   serve                 run it: --port (8080) --host (127.0.0.1)
   token                 make a new registrar token; the old one stops working
+  rotate-node           make a new signing node: --anchor-key; the old one stays honoured until retired
+  retire-node <node>    stop honouring an old node: every vouch it signed then fails
 options: --state <file> (default $OFFICE_STATE or .gip-v2/office.json)`;
 
 const STEWARD_WARNING = `
@@ -121,6 +130,28 @@ function token(statePath: string): void {
   console.log(`  ${t}`);
 }
 
+function rotateNode(v: Record<string, string | undefined>, statePath: string): void {
+  const anchorSk = readKey(v['anchor-key'], '--anchor-key');
+  const r = new Office(fileStore(statePath)).rotateNode(anchorSk);
+  console.log('new signing node, delegated for body.vouch; the withdrawal list is signed again');
+  console.log(`  node           ${r.node}`);
+  for (const n of r.nodes.slice(1)) console.log(`  still honoured ${n}   (retire-node ${n})`);
+  console.log('Keep the anchor key offline again. Retire an old node once its vouches are');
+  console.log('collected again, or at once if its key may be lost or taken.');
+}
+
+function retireNode(node: string | undefined, statePath: string): void {
+  const office = new Office(fileStore(statePath));
+  if (node === undefined) {
+    const older = office.info().nodes.slice(1);
+    fail(older.length === 0 ? 'retire-node <node>: no older node is honoured' : `retire-node <node>, one of:\n  ${older.join('\n  ')}`);
+  }
+  const r = office.retireNode(node);
+  console.log(`retired ${r.retired}: the withdrawal list is signed again without its delegation`);
+  console.log('  every vouch it signed now fails at the gate (node_not_delegated) once an app downloads the list');
+  console.log(`  honoured       ${r.nodes.join(', ')}`);
+}
+
 function main(): void {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
@@ -146,6 +177,8 @@ function main(): void {
   else if (cmd === 'init') init(v, statePath);
   else if (cmd === 'serve') serve(v, statePath);
   else if (cmd === 'token') token(statePath);
+  else if (cmd === 'rotate-node') rotateNode(v, statePath);
+  else if (cmd === 'retire-node') retireNode(arg, statePath);
   else if (cmd === undefined || help) console.log(HELP);
   else fail(`unknown command: ${cmd}\n${HELP}`);
 }
