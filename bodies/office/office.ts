@@ -16,6 +16,7 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { PrivateKey } from '@bsv/sdk';
 import {
+  BODY_VOUCH_OFFICE,
   BODY_VOUCH_PURPOSE,
   type BodyClaim,
   type BodyKind,
@@ -346,7 +347,10 @@ export class Office {
     return this.read((s) => didWebPath(s.did));
   }
 
-  /** A did:web DID document with the anchor as its one key, a secp256k1 Multikey. */
+  /**
+   * A did:web DID document with the anchor as its one key, a secp256k1
+   * Multikey, and the office as a service, where holders collect their vouches.
+   */
   didDocument(): Record<string, unknown> {
     return this.read((s) => {
       const vm = `${s.did}#anchor`;
@@ -359,6 +363,7 @@ export class Office {
         // The anchor signs one kind of statement, the delegation of a node.
         assertionMethod: [vm],
         capabilityDelegation: [vm],
+        service: [{ id: `${s.did}#vouch-office`, type: BODY_VOUCH_OFFICE, serviceEndpoint: s.baseUrl }],
       };
     });
   }

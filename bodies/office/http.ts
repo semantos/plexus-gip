@@ -3,7 +3,7 @@
  *
  * Public, no auth, open to any origin:
  *
- *     GET  /.well-known/did.json     the body's DID document: its anchor key
+ *     GET  /.well-known/did.json     the body's DID document: its anchor key, and this office
  *     GET  /status/1                 the withdrawal list, a signed JWT
  *     GET  /pickup/:code             what the body will and will not say
  *     POST /pickup/:code {proof}     the vouch, about the key that signed the proof

@@ -14,6 +14,7 @@ import {
   decodeStatusList,
   didKeyOf,
   didKeyOfSecret,
+  didWebDocumentUrl,
   fromB64url,
   fromUtf8,
   present,
@@ -24,6 +25,7 @@ import {
   statusListBit,
   verifyJwtByKid,
   verifyPresentation,
+  vouchOfficeOf,
 } from '../src';
 import {
   Office,
@@ -440,7 +442,7 @@ describe('the pilot, end to end', () => {
     expect(admit(creds.theo!, holder('theo'), entryJwt, listJwt, 'member')).toMatchObject({ ok: true });
   });
 
-  test('the DID document lists the anchor as a secp256k1 key', async () => {
+  test('the DID document lists the anchor as a secp256k1 key, and names the office', async () => {
     const r = await o.pub('GET', '/.well-known/did.json');
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toBe('application/did+json');
@@ -458,8 +460,12 @@ describe('the pilot, end to end', () => {
       ],
       assertionMethod: [vm],
       capabilityDelegation: [vm],
+      service: [{ id: `${DID}#vouch-office`, type: 'BodyVouchOffice', serviceEndpoint: BASE }],
     });
     expect(r.json.verificationMethod[0].publicKeyMultibase).toStartWith('zQ3s');
+    // A reader finds the document from the did, and the office from the document.
+    expect(didWebDocumentUrl(DID)).toBe(`${BASE}/.well-known/did.json`);
+    expect(vouchOfficeOf(r.json, DID)).toBe(BASE);
   });
 
   test('names never leave: no public response or JWT payload carries a label, group or roster id', () => {
@@ -681,6 +687,25 @@ describe('the state file', () => {
     expect(() =>
       initState({ did: DID, anchorSk: anchor, stewardSk: anchor, kind: 'school', claims: ['member'], periodEnds: [END_2026], now: NOW }),
     ).toThrow('self_registration');
+  });
+
+  test('an office not at the did\'s host is named in the DID document all the same', () => {
+    const { state } = initState({
+      did: 'did:web:example.org:schools:hillside',
+      baseUrl: 'https://office.example.net:8443',
+      anchorSk: anchor,
+      stewardSk: steward,
+      kind: 'school',
+      claims: ['member'],
+      periodEnds: [END_2026],
+      now: NOW,
+    });
+    const path = join(dir, 'elsewhere.json');
+    fileStore(path).save(state);
+    const office = new Office(fileStore(path), { now: () => clock });
+    expect(office.didDocumentPath()).toBe('/schools/hillside/did.json');
+    expect(office.info().didDocument).toBe('https://example.org/schools/hillside/did.json');
+    expect(vouchOfficeOf(office.didDocument(), 'did:web:example.org:schools:hillside')).toBe('https://office.example.net:8443');
   });
 
   test('an entry from a steward elsewhere is taken if it names this body and anchor', () => {
