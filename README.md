@@ -70,15 +70,17 @@ confirms one fact about a member from its own records (`member`,
 credential, an ES256K JWT, about a did:key the member's wallet made for one
 platform only. No name, birthdate or record number goes in it. The platform
 checks it offline: the holder's answer to its challenge, the body's entry in a
-steward-signed registry, the node's delegation from the body's anchor, and the
-body's withdrawal list. See [`docs/GIP-V2-BODY-ATTESTATION.md`](docs/GIP-V2-BODY-ATTESTATION.md).
+steward-signed registry, and the body's withdrawal list, which also carries the
+anchor's delegation of each signing node the body honours. The credential
+carries no delegation, so it stays small, and a node can be withdrawn. See
+[`docs/GIP-V2-BODY-ATTESTATION.md`](docs/GIP-V2-BODY-ATTESTATION.md).
 
 ```bash
 bun bodies/demo.ts   # a school, then a scout group, through the same code
 bun test             # every refusal, the known-answer file, the ported wire formats
 ```
 
-`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json` (`bun run office init`, then `serve`; see the doc's §6).
+`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json` (`bun run office init`, then `serve`; `rotate-node` and `retire-node` move to a new signing node and withdraw an old one; see the doc's §6).
 
 ## Paid-attestation portal (prototype)
 

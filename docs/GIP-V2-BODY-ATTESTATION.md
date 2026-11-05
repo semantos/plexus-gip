@@ -1,7 +1,9 @@
 # Any body as attestor
 
 **Status:** built in `src/bodies/`, tested in `test/bodies.test.ts`, pinned by
-`test/fixtures/bodies_kat.json`; nothing live. 4 November 2026.
+`test/fixtures/bodies_kat.json`; nothing live. 4 November 2026. On 5 November
+the node's delegation moved out of every vouch and onto the withdrawal list
+(Todd's decision, so a seat card with several vouches fits one QR code).
 **Generalises:** the "School-vouched age credentials" deck (October 2026) and
 the FamilySearch attestor already in this kit (`src/social/familysearch.ts`,
 `src/social/delegation.ts`).
@@ -36,9 +38,9 @@ a credential: no name, birthdate, student or membership number.
 
 ```
  steward (registry) ── signs ──▶ registry entry: body did:web, anchor key, kind, claims, period ends, withdrawal list
- body root (anchor, Plexus page-0) ── delegateSigner(…, 'body.vouch') ──▶ signing node (hosted)
- signing node ── signs ──▶ vouch (VC 2.0, ES256K JWT) about the holder's key for ONE relationship
-                     └──▶ withdrawal list (Bitstring Status List), fetched whole
+ body root (anchor, Plexus page-0) ── delegateSigner(…, 'body.vouch') ──▶ signing node(s) (hosted)
+ signing node ── signs ──▶ vouch (VC 2.0, ES256K JWT) about the holder's key for ONE relationship; no delegation in it
+                     └──▶ withdrawal list (Bitstring Status List), fetched whole, carrying each honoured node's delegation
  holder ── signs the app's one-time challenge ──▶ presentation ──▶ app checks everything offline
 ```
 
@@ -48,10 +50,21 @@ a credential: no name, birthdate, student or membership number.
   and its withdrawal list. A steward cannot register itself: a body vouching
   for itself counts for nothing.
 - **Day-to-day signing.** The body's root never signs a vouch. It signs a GIP
-  delegation (`delegateSigner(root, node, 'body.vouch')`) to a hosted node, and
-  each vouch carries that delegation as `evidence`. This is the deck's "proof
-  that a hosted node acts for its school". Replacing the node is a new
-  delegation; the verifier's trust stays with the root.
+  delegation (`delegateSigner(root, node, 'body.vouch')`) to a hosted node.
+  This is the deck's "proof that a hosted node acts for its school". The
+  delegation does not travel in the vouch: the withdrawal list carries it, as
+  `evidence: [{type: 'SigningNodeDelegation', delegation}, …]`, one for each
+  node the body still honours, and one of those nodes signs the list. A vouch
+  that carries `evidence` is refused, so there is one format. The verifier's
+  trust stays with the root.
+- **A new node, and withdrawing one.** Replacing the node is a new delegation:
+  the new node signs the list, and the list carries both delegations while
+  the old node's vouches are still to be honoured. Withdrawing a node is
+  taking its delegation off the list and signing it again; every vouch that
+  node signed then fails with `node_not_delegated` at the app's next download.
+  It holds only while the app takes the list from the entry's URL and nowhere
+  else: a withdrawn node's key can still sign a list carrying its own old
+  delegation.
 - **Expiry is a period end, never a birthday.** A credential that expired on a
   child's 13th birthday would give the birthdate away, so `validUntil` must be
   one of the entry's published period ends (the end of the school year, the
@@ -62,26 +75,41 @@ a credential: no name, birthdate, student or membership number.
   person. For a child the root is their family-plan seat (BitPiggy
   `family/`), so the guardian can recover it.
 - **Withdrawal.** The node signs the body's Bitstring Status List; apps fetch it
-  whole, so the body never learns who checked whom.
+  whole, so the body never learns who checked whom. The same download says
+  which nodes still count.
 - **Presentation.** The holder's relationship key signs the app's audience and
   one-time nonce over the vouch, as a JWT typed `vp+jwt` so a credential cannot
   pass for one; the app checks the presentation, the vouch, the registry entry,
-  the delegation, the dates and the withdrawal list, in that order, without
-  contacting the body.
+  the withdrawal list and the delegations on it, the claim, the dates and the
+  vouch's bit, in that order, without contacting the body.
 
 ## 3. What a verifier refuses, in order
 
 `bad_presentation`, `wrong_audience`, `wrong_nonce`, `stale`, `bad_credential`,
-`subject_mismatch`, `not_registered`, `node_not_delegated`, `claim_not_allowed`,
-`not_yet_valid`, `expired`, `no_status_list`, `withdrawn`, `missing_claim`.
+`subject_mismatch`, `not_registered`, `no_status_list`, `node_not_delegated`,
+`claim_not_allowed`, `not_yet_valid`, `expired`, `withdrawn`, `missing_claim`.
 The order is the contract: two implementations given the same input must give
-the same first reason. The gate also refuses, as `claim_not_allowed`, a vouch
-whose expiry is not one of the entry's period ends; as `bad_credential`, a vouch
-carrying any term beyond its one claim (a name slipped in, say); and as
-`no_status_list`, a vouch pointing at a withdrawal list other than the entry's.
+the same first reason. The list now comes before the node's delegation, the
+claim and the dates, because the delegations are on it.
+
+- `bad_credential` also covers a vouch carrying any term beyond its one claim
+  (a name slipped in, say) and a vouch carrying `evidence` at all.
+- `no_status_list`: no list held for the entry's `statusList` URL; or the list
+  is malformed, its signature fails, it is for another body or URL or not yet
+  valid; or its signer (`kid`) is not delegated, for `body.vouch`, by the
+  entry's anchor in the list's own evidence; or the vouch's status entry
+  points at another URL.
+- `node_not_delegated`: the vouch's signer (`kid`) is not delegated, for
+  `body.vouch`, by the entry's anchor in the list's evidence.
+- `claim_not_allowed` also covers an expiry that is not one of the entry's
+  period ends.
+
 When a body has more than one entry in force (a renewal), the first that
-accepts wins. `test/fixtures/bodies_kat.json` pins it for the kids'
-world server (Elixir) and any other port.
+accepts wins. `test/fixtures/bodies_kat.json` pins it for the kids' world
+server (Elixir) and any other port. It pins a rotation: node-1 signed the
+vouch, node-2 signs the list, and the list carries both delegations, node-2's
+first, so a port that looks only at the first delegation, or only at the list
+signer's, gets it wrong.
 
 ## 4. Format
 
@@ -96,18 +124,22 @@ package's whole `wire_kat.json`, and signs byte-identical JWTs
 decodes the other's lists, but the compressed bytes differ, so a shared
 known-answer file should compare a status list by its decoded bits.
 
+Sizes, from the known-answer file (a `member` vouch): a vouch JWT is 980
+bytes, down from 1,528 when it carried the delegation, and a presentation is
+1,699 bytes, down from 2,430. The largest QR code (version 40, level L) holds
+2,953 bytes, so a vouch went from just over half of one to a third. The list
+grows instead, by about 530 bytes for each node it honours (1,454 bytes with
+one, 1,984 with two), and an app fetches it once for the whole body.
+
 ## 5. What it does not settle
 
-- **Withdrawing a node.** A replaced node's delegation cannot be withdrawn yet:
-  it keeps signing until the body's registry entry is reissued. The fix is a
-  second status list, of the body's delegations, checked beside the members'
-  one.
 - **Who stewards.** The deck's "published rule for which schools count" is now
   a registry entry signed by a steward; who the stewards are is a governance
   question, not a code one. For a one-school pilot the operator can steward,
   said plainly.
 - **Bonds and referees.** The deck's money at risk and named referee sit beside
-  this, unchanged; a bond can ride in `evidence` next to the delegation.
+  this, unchanged. A bond is the body's, so it would ride on the list beside
+  the delegations, never in a vouch.
 - **Issuing and presenting endpoints.** OpenID4VCI and OpenID4VP are the
   standards to wrap this in; the pilot can issue over a one-time QR link at the
   office and present inside the app's own sign-in.
@@ -120,11 +152,13 @@ known-answer file should compare a status list by its decoded bits.
 ## 6. The office
 
 `bodies/office/` is the body's issuing service, a library and a Bun HTTP server
-run by or for one body (`bun run office init`, `serve`, `token`). Its state is
-one JSON file, mode 0600, written atomically: the node key, the delegation, the
+run by or for one body (`bun run office init`, `serve`, `token`, `rotate-node`,
+`retire-node`). Its state is one JSON file, mode 0600, written atomically: the
+node key, the delegations the body honours (the current node's first), the
 registry entry, the roster, the vouches and the pickups. The anchor key signs
-the delegation at `init` and is not kept. Names stay on the roster: no public
-answer and no vouch carries a label, group or roster id (the tests scan them).
+a node's delegation at `init` and at `rotate-node`, and is not kept. Names stay
+on the roster: no public answer and no vouch carries a label, group or roster
+id (the tests scan them).
 
 - **The desk**, behind a bearer token stored hashed: add rows, record consent,
   vouch a class, withdraw a family (with a "guardian may sponsor onward" note),
@@ -134,6 +168,14 @@ answer and no vouch carries a label, group or roster id (the tests scan them).
   and will not say, then each app's key collects its own vouch with a proof
   `{aud: body, nonce: code, iat}` (OpenID4VCI's `jwt` proof type): up to four
   keys a code, each its own status index, and one key holds one row's vouches.
+- **Nodes.** `rotate-node --anchor-key <file>` makes a new node key; the
+  anchor key signs its delegation, the new node signs the list, and the old
+  node's delegation stays on it, so its vouches still pass. `retire-node
+  <node>` takes an old node's delegation off: every vouch that node signed
+  then fails with `node_not_delegated`, and those families need a new one. The
+  current node cannot be retired. The list is signed again whenever the
+  delegations change.
 - **Public**: `/.well-known/did.json` (the anchor as a secp256k1 Multikey) and
-  `/status/1`, signed again at each withdrawal. A pilot may sign its own entry
-  with a local steward key; `init` warns that a body must not steward itself.
+  `/status/1`, signed again at each withdrawal and each change of node. A
+  pilot may sign its own entry with a local steward key; `init` warns that a
+  body must not steward itself.

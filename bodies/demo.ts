@@ -4,10 +4,12 @@
  *     bun bodies/demo.ts
  *
  * A registry steward lists Hillside Primary. The school's anchor delegates a
- * hosted node. The registrar's node vouches `member` for a child and
- * `guardian_of_member` for a parent, each about a key their own wallet made
- * for this one platform. The kids' world gate checks both presentations
- * offline. The school withdraws the child and the gate refuses. Then a scout
+ * hosted node, and the delegation travels on the withdrawal list. The
+ * registrar's node vouches `member` for a child and `guardian_of_member` for a
+ * parent, each about a key their own wallet made for this one platform. The
+ * kids' world gate checks both presentations offline. The school withdraws
+ * the child and the gate refuses. The school moves to a new node and then
+ * withdraws the old one, and the old node's vouch stops passing. Then a scout
  * group runs through the same function with kind `scouts` and no code change.
  *
  * Every name, record and address here is made up.
@@ -16,6 +18,7 @@
 import { createHash } from 'node:crypto';
 import { PrivateKey } from '@bsv/sdk';
 import {
+  type Association,
   BODY_VOUCH_PURPOSE,
   type BodyClaim,
   type BodyKind,
@@ -97,6 +100,7 @@ function runPilot(p: Pilot): void {
   const d = readDelegation(delegation)!;
   console.log(`  anchor ${short(d.anchor)} → node ${short(d.node)}   purpose=${d.purpose}`);
   console.log('  the anchor key goes back in the safe; the node signs from here on');
+  console.log('  the delegation goes on the withdrawal list, not in each vouch');
 
   h('[3] Each wallet makes a key for this one platform');
   const childSk = relationshipKey(key(`${p.did}/child-root`), GATE);
@@ -129,7 +133,7 @@ function runPilot(p: Pilot): void {
     validUntil: PERIOD_ENDS[0]!,
   });
   const shown = payloadOf(childCred);
-  console.log('  the child\'s credential, as it travels:');
+  console.log(`  the child's credential, as it travels (${childCred.length} bytes, no delegation inside):`);
   console.log(`    issuer            ${shown.issuer}`);
   console.log(`    credentialSubject ${JSON.stringify(shown.credentialSubject).replace(/did:key:[^"]+/, (s) => short(s))}`);
   console.log(`    validUntil        ${shown.validUntil}`);
@@ -140,7 +144,7 @@ function runPilot(p: Pilot): void {
 
   h('[5] The node publishes the withdrawal list (16 KiB of bits, fetched whole)');
   const lists = { [statusUrl]: issueStatusList(node, { issuer: p.did, delegations: [delegation], url: statusUrl, revoked: [], validFrom: now - 60 }) };
-  console.log(`  ${statusUrl}   nothing withdrawn`);
+  console.log(`  ${statusUrl}   nothing withdrawn; carries the node's delegation`);
 
   const gate = (statusLists: Record<string, string>, require: BodyClaim, n: string) => ({
     audience: GATE,
@@ -169,6 +173,36 @@ function runPilot(p: Pilot): void {
   const n3 = nonce();
   const v3 = verifyPresentation(present({ credentialJwt: childCred, subjectSk: childSk, audience: GATE, nonce: n3, at: now }), gate(after, 'member', n3));
   console.log(`  child asks in again → ${v3.ok ? 'ok' : `refused: ${v3.reason}`} ${ok(!v3.ok)}`);
+
+  h(`[8] ${p.name} moves to a new node, then withdraws the old one`);
+  const node2 = key(`${p.did}/node-2`);
+  const delegation2 = delegateSigner(anchor, pub(node2), BODY_VOUCH_PURPOSE);
+  const parentCred2 = issueVouch({
+    nodeSk: node2,
+    entry,
+    subject: didKeyOfSecret(parentSk),
+    claim: 'guardian_of_member',
+    statusIndex: 103,
+    validFrom: now - 20,
+    validUntil: PERIOD_ENDS[0]!,
+  });
+  const listOf = (delegations: Association[], at: number) => ({
+    [statusUrl]: issueStatusList(node2, { issuer: p.did, delegations, url: statusUrl, revoked: [101], validFrom: at }),
+  });
+  const parentIn = (cred: string, statusLists: Record<string, string>) => {
+    const n = nonce();
+    return verifyPresentation(present({ credentialJwt: cred, subjectSk: parentSk, audience: GATE, nonce: n, at: now }), gate(statusLists, 'guardian_of_member', n));
+  };
+  const said = (v: ReturnType<typeof verifyPresentation>) => (v.ok ? 'ok' : `refused: ${v.reason}`);
+  console.log('  the anchor delegates node-2; node-2 signs the list, which carries both delegations');
+  const v4 = parentIn(parentCred, listOf([delegation2, delegation], now - 20));
+  console.log(`  parent's vouch from node-1   → ${said(v4)} ${ok(v4.ok)}`);
+  console.log('  node-1 withdrawn: its delegation comes off, and node-2 signs the list again');
+  const retired = listOf([delegation2], now - 10);
+  const v5 = parentIn(parentCred, retired);
+  console.log(`  parent's vouch from node-1   → ${said(v5)} ${ok(!v5.ok)}`);
+  const v6 = parentIn(parentCred2, retired);
+  console.log(`  parent's vouch from node-2   → ${said(v6)} ${ok(v6.ok)}`);
 }
 
 runPilot({
