@@ -78,6 +78,8 @@ bun bodies/demo.ts   # a school, then a scout group, through the same code
 bun test             # every refusal, the known-answer file, the ported wire formats
 ```
 
+`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json` (`bun run office init`, then `serve`; see the doc's §6).
+
 ## Paid-attestation portal (prototype)
 
 FamilySearch can **charge to issue** an attestation over an x402-style `402`
@@ -159,4 +161,5 @@ The `docs/` folder carries the "why", not just the "how":
 - The `src/` modules are carved copies from semantos-core (the Plexus/Semantos
   monorepo); the kit-specific pieces are this README, the `src/index.ts` barrel,
   `walkthrough.ts`, `cli.ts`, `sign.ts`, `delegation-demo.ts`, the `portal/`
-  and `familysearch/` entry points, and `src/bodies/` with `bodies/demo.ts`.
+  and `familysearch/` entry points, and `src/bodies/` with `bodies/demo.ts` and
+  `bodies/office/`.

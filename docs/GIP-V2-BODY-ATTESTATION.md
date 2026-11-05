@@ -116,3 +116,24 @@ known-answer file should compare a status list by its decoded bits.
   design.
 - **Self-proven ages.** The L1 range proofs in `src/zk/` remain unaudited; v1
   vouches ages only from a body's records.
+
+## 6. The office
+
+`bodies/office/` is the body's issuing service, a library and a Bun HTTP server
+run by or for one body (`bun run office init`, `serve`, `token`). Its state is
+one JSON file, mode 0600, written atomically: the node key, the delegation, the
+registry entry, the roster, the vouches and the pickups. The anchor key signs
+the delegation at `init` and is not kept. Names stay on the roster: no public
+answer and no vouch carries a label, group or roster id (the tests scan them).
+
+- **The desk**, behind a bearer token stored hashed: add rows, record consent,
+  vouch a class, withdraw a family (with a "guardian may sponsor onward" note),
+  and `GET /desk/needs`, the home list of what needs the school.
+- **Pickup.** Vouching a consented row makes a one-time 128-bit code, good for
+  seven days or to the period end. The parent's phone reads what the body will
+  and will not say, then each app's key collects its own vouch with a proof
+  `{aud: body, nonce: code, iat}` (OpenID4VCI's `jwt` proof type): up to four
+  keys a code, each its own status index, and one key holds one row's vouches.
+- **Public**: `/.well-known/did.json` (the anchor as a secp256k1 Multikey) and
+  `/status/1`, signed again at each withdrawal. A pilot may sign its own entry
+  with a local steward key; `init` warns that a body must not steward itself.
