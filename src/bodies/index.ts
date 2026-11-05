@@ -13,17 +13,20 @@
  *      steward the platform trusts. A body that registers itself counts for
  *      nothing.
  *   3. The body's withdrawal list, fetched whole, so the fetch does not say
- *      which member was checked.
+ *      which member was checked. It also carries the anchor's delegation of
+ *      each node the body honours, which is how step 1 reaches the anchor.
  *
  * Standards: W3C VC Data Model 2.0 as a JWT with ES256K, Bitstring Status List
  * 1.0, did:web for the body, did:key for the member, with a different did:key
  * for each relationship ({@link relationshipKey}).
  *
  * The body's anchor (its Plexus page-0) never signs a credential. It delegates
- * a signing node with `delegateSigner(anchorSk, nodePub, BODY_VOUCH_PURPOSE)`,
- * and every credential and withdrawal list the node signs carries that
- * delegation as evidence. Rotation is a new delegation. Credentials from the
- * old node still verify, because each one carries its own.
+ * a signing node with `delegateSigner(anchorSk, nodePub, BODY_VOUCH_PURPOSE)`.
+ * The delegations travel on the withdrawal list, as its evidence: one for each
+ * node the body still honours, and the list is signed by one of them. A vouch
+ * carries none, so a few of them fit one QR code. Rotation puts the new node's
+ * delegation on the list beside the old one; withdrawing a node takes its
+ * delegation off, and every vouch it signed fails at the next download.
  *
  * One claim per credential, so a holder discloses one fact at a time.
  */
@@ -160,32 +163,39 @@ function isAssociation(x: unknown): x is Association {
   return ['kind', 'display', 'vouchedBy', 'signature'].every((k) => typeof o[k] === 'string');
 }
 
-/** Why a delegation does not let `nodeHex` vouch for `anchor`, or null if it does. */
-function delegationFault(d: unknown, nodeHex: string, anchor?: string): string | null {
-  if (!isAssociation(d)) return 'delegation is malformed';
+type CheckedDelegation = { ok: true; anchor: string; node: string } | { ok: false; fault: string };
+
+/** Who delegated which node, if the delegation lets that node vouch; else why not. */
+function checkDelegation(d: unknown): CheckedDelegation {
+  if (!isAssociation(d)) return { ok: false, fault: 'delegation is malformed' };
   const info = readDelegation(d);
-  if (info === null) return 'delegation does not verify';
-  if (anchor !== undefined && info.anchor !== anchor) return 'delegation is not from the registered anchor';
-  if (info.node !== nodeHex) return 'delegation is not for this node';
-  if (info.purpose !== BODY_VOUCH_PURPOSE) return `delegation purpose is not ${BODY_VOUCH_PURPOSE}`;
-  return null;
+  if (info === null) return { ok: false, fault: 'delegation does not verify' };
+  if (info.purpose !== BODY_VOUCH_PURPOSE) return { ok: false, fault: `delegation purpose is not ${BODY_VOUCH_PURPOSE}` };
+  return { ok: true, anchor: info.anchor, node: info.node };
 }
 
-const evidenceOf = (d: Association) => [
-  {
+const evidenceOf = (ds: readonly Association[]) =>
+  ds.map((d) => ({
     type: DELEGATION_EVIDENCE_TYPE,
     delegation: { kind: d.kind, display: d.display, vouchedBy: d.vouchedBy, signature: d.signature },
-  },
-];
+  }));
 
-/** Does some evidence item delegate `signerDid` from `anchor` for body.vouch? */
-function chainsToAnchor(evidence: unknown, signerDid: string, anchor: string): boolean {
-  if (!Array.isArray(evidence)) return false;
-  const nodeHex = hex(publicKeyFromDidKey(signerDid));
-  return evidence.some(
-    (e) => e?.type === DELEGATION_EVIDENCE_TYPE && delegationFault(e.delegation, nodeHex, anchor) === null,
-  );
+/**
+ * The nodes, as compressed hex, that a list's evidence shows `anchor`
+ * delegated for body.vouch. Anything else in the evidence is passed over.
+ */
+function delegatedNodes(evidence: unknown, anchor: string): Set<string> {
+  const nodes = new Set<string>();
+  if (!Array.isArray(evidence)) return nodes;
+  for (const e of evidence) {
+    if (e?.type !== DELEGATION_EVIDENCE_TYPE) continue;
+    const d = checkDelegation(e.delegation);
+    if (d.ok && d.anchor === anchor) nodes.add(d.node);
+  }
+  return nodes;
 }
+
+const nodeHexOf = (did: string): string => hex(publicKeyFromDidKey(did));
 
 // ── registry: who counts ─────────────────────────────────────────────────────
 
@@ -306,12 +316,10 @@ export function readRegistryEntry(jwt: string): RegistryEntry | null {
 // ── issuing ──────────────────────────────────────────────────────────────────
 
 export interface VouchInput {
-  /** The body's signing node. */
+  /** The body's signing node. Its delegation travels on the list, not here. */
   nodeSk: PrivateKey;
-  /** The anchor's delegation of that node, for {@link BODY_VOUCH_PURPOSE}. */
-  delegation: Association;
   /** The body's registry entry, as {@link readRegistryEntry} returns it. */
-  entry: Pick<RegistryEntry, 'did' | 'anchor' | 'claims' | 'periodEnds' | 'statusList'>;
+  entry: Pick<RegistryEntry, 'did' | 'claims' | 'periodEnds' | 'statusList'>;
   /** The holder's did:key for this relationship. */
   subject: string;
   claim: BodyClaim;
@@ -325,9 +333,11 @@ export interface VouchInput {
 /**
  * The body's node vouches one claim about a holder's pairwise key.
  *
- * The credential carries the subject key, the one claim, the dates, a pointer
- * into the withdrawal list, and the delegation. There is no field for a name,
- * a birthdate or a record number, so none can leak.
+ * The credential carries the subject key, the one claim, the dates and a
+ * pointer into the withdrawal list. There is no field for a name, a birthdate
+ * or a record number, so none can leak. Nor is there one for the node's
+ * delegation: the gate finds that on the list, and only while the body
+ * honours the node.
  */
 export function issueVouch(v: VouchInput): string {
   if (!isClaim(v.claim)) throw new WireError('unknown_claim', String(v.claim));
@@ -346,8 +356,6 @@ export function issueVouch(v: VouchInput): string {
   if (!Number.isInteger(v.statusIndex) || v.statusIndex < 0 || v.statusIndex >= STATUS_LIST_BITS) {
     throw new WireError('bad_status_index', String(v.statusIndex));
   }
-  const fault = delegationFault(v.delegation, v.nodeSk.toPublicKey().toString(), v.entry.anchor);
-  if (fault !== null) throw new WireError('bad_delegation', fault);
   return signJwt(
     {
       '@context': [VC_CONTEXT, BODIES_CONTEXT],
@@ -362,7 +370,6 @@ export function issueVouch(v: VouchInput): string {
         statusListIndex: String(v.statusIndex),
         statusListCredential: v.entry.statusList,
       },
-      evidence: evidenceOf(v.delegation),
     },
     v.nodeSk,
   );
@@ -371,8 +378,12 @@ export function issueVouch(v: VouchInput): string {
 export interface StatusListInput {
   /** The body's did:web: the same issuer as its credentials. */
   issuer: string;
-  /** The anchor's delegation of the signing node. */
-  delegation: Association;
+  /**
+   * The anchor's delegation of every node the body still honours, for
+   * {@link BODY_VOUCH_PURPOSE}: the signing node's, and an old node's while its
+   * vouches are still to pass. A node left out is withdrawn.
+   */
+  delegations: readonly Association[];
   /** Where the list is published: the registry entry's `statusList`. */
   url: string;
   /** Withdrawn indexes. */
@@ -380,11 +391,25 @@ export interface StatusListInput {
   validFrom: Instant;
 }
 
-/** The body's withdrawal list, signed by its node and carrying the node's delegation. */
+/**
+ * The body's withdrawal list, signed by one of its nodes and carrying, as
+ * evidence, the delegation of every node the body honours.
+ */
 export function issueStatusList(nodeSk: PrivateKey, c: StatusListInput): string {
   if (!DID_WEB.test(c.issuer)) throw new WireError('bad_issuer', 'issuer must be the body did:web');
-  const fault = delegationFault(c.delegation, nodeSk.toPublicKey().toString());
-  if (fault !== null) throw new WireError('bad_delegation', fault);
+  const nodes = new Set<string>();
+  const anchors = new Set<string>();
+  c.delegations.forEach((x, i) => {
+    const d = checkDelegation(x);
+    if (!d.ok) throw new WireError('bad_delegation', `delegations[${i}]: ${d.fault}`);
+    if (nodes.has(d.node)) throw new WireError('bad_delegation', `delegations[${i}]: one delegation per node`);
+    nodes.add(d.node);
+    anchors.add(d.anchor);
+  });
+  if (anchors.size > 1) throw new WireError('bad_delegation', 'the delegations must all be from one anchor');
+  if (!nodes.has(nodeSk.toPublicKey().toString())) {
+    throw new WireError('bad_delegation', 'the signing node must be among the delegations');
+  }
   return signJwt(
     {
       '@context': [VC_CONTEXT],
@@ -398,7 +423,7 @@ export function issueStatusList(nodeSk: PrivateKey, c: StatusListInput): string 
         statusPurpose: 'revocation',
         encodedList: encodeStatusList(c.revoked),
       },
-      evidence: evidenceOf(c.delegation),
+      evidence: evidenceOf(c.delegations),
     },
     nodeSk,
   );
@@ -435,11 +460,11 @@ export const BODY_REFUSALS = [
   'bad_credential',
   'subject_mismatch',
   'not_registered',
+  'no_status_list',
   'node_not_delegated',
   'claim_not_allowed',
   'not_yet_valid',
   'expired',
-  'no_status_list',
   'withdrawn',
   'missing_claim',
 ] as const;
@@ -481,13 +506,14 @@ interface Vouch {
   validUntilIso: string;
   statusUrl: string;
   statusIndex: number;
-  evidence: unknown;
 }
 
 /** A vouch the rules can use, or null. */
 function toVouch(v: SignedJwt | null): Vouch | null {
   if (v === null || v.payload.type[1] !== BODY_VOUCH_TYPE) return null;
   const p = v.payload;
+  // One format: the delegation is on the list, so a vouch carrying evidence is not one.
+  if (Object.hasOwn(p, 'evidence')) return null;
   if (!DID_WEB.test(p.issuer)) return null;
   const validFrom = parseIsoSeconds(p.validFrom);
   const validUntil = parseIsoSeconds(p.validUntil);
@@ -518,24 +544,34 @@ function toVouch(v: SignedJwt | null): Vouch | null {
     validUntilIso: p.validUntil,
     statusUrl: s.statusListCredential,
     statusIndex: Number(s.statusListIndex),
-    evidence: p.evidence,
   };
 }
 
-/** The withdrawal list's bits, or null unless the body's delegated node signed it and it is in force. */
-function listBits(jwt: string | undefined, vouch: Vouch, entry: RegistryEntry, now: number): Uint8Array | null {
+interface HeldList {
+  bits: Uint8Array;
+  /** The nodes, as compressed hex, its evidence shows the entry's anchor delegated. */
+  nodes: Set<string>;
+}
+
+/**
+ * The entry's withdrawal list as the verifier holds it, or null unless it is
+ * well formed, in force, and signed by a node its own evidence shows the
+ * entry's anchor delegated for body.vouch.
+ */
+function heldList(jwt: string | undefined, entry: RegistryEntry, now: number): HeldList | null {
   if (jwt === undefined) return null;
   const v = verifyJwtByKid(jwt);
   if (v === null || v.payload.type[1] !== STATUS_LIST_TYPE) return null;
   const p = v.payload;
-  if (p.issuer !== vouch.issuer || p.id !== entry.statusList) return null;
+  if (p.issuer !== entry.did || p.id !== entry.statusList) return null;
   const validFrom = parseIsoSeconds(p.validFrom);
   if (validFrom === null || validFrom > now) return null;
   const cs = p.credentialSubject;
   if (cs?.type !== 'BitstringStatusList' || cs.statusPurpose !== 'revocation' || typeof cs.encodedList !== 'string') return null;
-  if (!chainsToAnchor(p.evidence, v.signer, entry.anchor)) return null;
+  const nodes = delegatedNodes(p.evidence, entry.anchor);
+  if (!nodes.has(nodeHexOf(v.signer))) return null;
   try {
-    return decodeStatusList(cs.encodedList);
+    return { bits: decodeStatusList(cs.encodedList), nodes };
   } catch {
     return null;
   }
@@ -546,15 +582,16 @@ function inForce(e: RegistryEntry, now: number): boolean {
 }
 
 function checkAgainst(entry: RegistryEntry, vouch: Vouch, o: VerifyPresentationOptions): BodyVerdict {
-  if (!chainsToAnchor(vouch.evidence, vouch.node, entry.anchor)) return fail('node_not_delegated');
+  if (vouch.statusUrl !== entry.statusList || !Object.hasOwn(o.statusLists, entry.statusList)) return fail('no_status_list');
+  const list = heldList(o.statusLists[entry.statusList], entry, o.now);
+  if (list === null || vouch.statusIndex >= list.bits.length * 8) return fail('no_status_list');
+  // The vouch's node must be on the same list: a node the body withdrew is not.
+  if (!list.nodes.has(nodeHexOf(vouch.node))) return fail('node_not_delegated');
   // The registry also fixes when credentials may expire, so an expiry that is a birthday does not pass.
   if (!entry.claims.includes(vouch.claim) || !entry.periodEnds.includes(vouch.validUntilIso)) return fail('claim_not_allowed');
   if (o.now < vouch.validFrom) return fail('not_yet_valid');
   if (o.now >= vouch.validUntil) return fail('expired');
-  if (vouch.statusUrl !== entry.statusList || !Object.hasOwn(o.statusLists, entry.statusList)) return fail('no_status_list');
-  const bits = listBits(o.statusLists[entry.statusList], vouch, entry, o.now);
-  if (bits === null || vouch.statusIndex >= bits.length * 8) return fail('no_status_list');
-  if (statusListBit(bits, vouch.statusIndex)) return fail('withdrawn');
+  if (statusListBit(list.bits, vouch.statusIndex)) return fail('withdrawn');
   if (vouch.terms[o.require] !== true) return fail('missing_claim');
   return { ok: true, body: { did: entry.did, kind: entry.kind }, claim: o.require, subject: vouch.subject };
 }

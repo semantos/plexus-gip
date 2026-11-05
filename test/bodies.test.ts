@@ -6,12 +6,14 @@ import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { PrivateKey } from '@bsv/sdk';
 import {
+  type Association,
   BODY_KINDS,
   BODY_REFUSALS,
   BODY_VOUCH_PURPOSE,
   type BodyClaim,
   type BodyKind,
   type BodyRefusal,
+  DELEGATION_EVIDENCE_TYPE,
   EDGE_CREATION,
   type RegistryEntry,
   type VerifyPresentationOptions,
@@ -93,12 +95,24 @@ function body(spec: BodySpec, over: { validUntil?: string } = {}) {
   });
   const entry = readRegistryEntry(entryJwt);
   if (entry === null) throw new Error('entry did not read back');
-  const list = (revoked: number[] = [], signer = node, d = delegation) =>
-    issueStatusList(signer, { issuer: spec.did, delegation: d, url: statusList, revoked, validFrom: NOW - 3600 });
+  const list = (revoked: number[] = [], signer = node, delegations = [delegation]) =>
+    issueStatusList(signer, { issuer: spec.did, delegations, url: statusList, revoked, validFrom: NOW - 3600 });
   return { spec, anchor, node, delegation, statusList, entryJwt, entry, list };
 }
 
 type Body = ReturnType<typeof body>;
+
+/** Delegations as a list carries them in `evidence`. */
+const asEvidence = (...ds: Association[]) => ds.map((delegation) => ({ type: DELEGATION_EVIDENCE_TYPE, delegation }));
+
+/** A list signed as given, whatever its evidence says: issueStatusList refuses most of these. */
+function rawList(b: Body, signer: PrivateKey, evidence: unknown): string {
+  const { evidence: _, ...p } = payloadOf(b.list());
+  return signJwt(evidence === undefined ? p : { ...p, evidence }, signer);
+}
+
+/** The gate holding one list for the body. */
+const holding = (b: Body, listJwt: string) => gate(b, { statusLists: { [b.statusList]: listJwt } });
 
 /** A holder's relationship key for the kids' world. */
 const holder = (label: string) => relationshipKey(key(`${label}/root`), RP);
@@ -106,7 +120,6 @@ const holder = (label: string) => relationshipKey(key(`${label}/root`), RP);
 function vouch(b: Body, subjectSk: PrivateKey, over: Partial<Parameters<typeof issueVouch>[0]> = {}): string {
   return issueVouch({
     nodeSk: b.node,
-    delegation: b.delegation,
     entry: b.entry,
     subject: didKeyOfSecret(subjectSk),
     claim: 'member',
@@ -211,6 +224,14 @@ describe('the gate refuses, each for its own reason', () => {
     expect(verifyPresentation(show(signJwt(twoTerms, b.node), mia), gate(b))).toEqual(refused('bad_credential'));
   });
 
+  test('bad_credential: a vouch carrying evidence, even the node\'s own delegation as v1 put it', () => {
+    expect(payloadOf(cred)).not.toHaveProperty('evidence');
+    for (const evidence of [asEvidence(b.delegation), [], null]) {
+      const v1 = signJwt({ ...payloadOf(cred), evidence }, b.node);
+      expect(verifyPresentation(show(v1, mia), gate(b))).toEqual(refused('bad_credential'));
+    }
+  });
+
   test('subject_mismatch: someone else presents the credential', () => {
     const thief = holder('thief');
     expect(verifyPresentation(show(cred, thief), gate(b))).toEqual(refused('subject_mismatch'));
@@ -228,10 +249,105 @@ describe('the gate refuses, each for its own reason', () => {
     expect(verifyPresentation(ok, selfGate)).toEqual(refused('not_registered'));
   });
 
-  test('node_not_delegated: a delegation signed by someone other than the anchor', () => {
-    const forged = delegateSigner(impostor, pub(b.node), BODY_VOUCH_PURPOSE);
-    const c = vouch(b, mia, { delegation: forged, entry: { ...b.entry, anchor: pub(impostor) } });
+  test('no_status_list: none held, or held only under another URL', () => {
+    expect(verifyPresentation(ok, gate(b, { statusLists: {} }))).toEqual(refused('no_status_list'));
+    const elsewhere = { 'https://hillside.example.edu.au/status/2': b.list() };
+    expect(verifyPresentation(ok, gate(b, { statusLists: elsewhere }))).toEqual(refused('no_status_list'));
+  });
+
+  test('no_status_list: a list that is malformed, edited, or not a status list', () => {
+    expect(verifyPresentation(ok, holding(b, 'not-a-jwt'))).toEqual(refused('no_status_list'));
+    const [h, , s] = b.list([7]).split('.');
+    const cleared = payloadOf(b.list([7]));
+    cleared.credentialSubject.encodedList = payloadOf(b.list()).credentialSubject.encodedList;
+    expect(verifyPresentation(ok, holding(b, `${h}.${Buffer.from(JSON.stringify(cleared)).toString('base64url')}.${s}`))).toEqual(
+      refused('no_status_list'),
+    );
+    expect(verifyPresentation(ok, holding(b, b.entryJwt))).toEqual(refused('no_status_list'));
+    const later = signJwt({ ...payloadOf(b.list()), validFrom: '2026-11-05T00:00:00Z' }, b.node);
+    expect(verifyPresentation(ok, holding(b, later))).toEqual(refused('no_status_list'));
+  });
+
+  test('no_status_list: a list whose signer the list\'s own evidence does not delegate from the anchor', () => {
+    const rogue = key('rogue-node');
+    const node2 = key(`${SCHOOL.label}/node-2`);
+    const lists = [
+      // A node the impostor delegated, carrying that delegation.
+      b.list([], rogue, [delegateSigner(impostor, pub(rogue), BODY_VOUCH_PURPOSE)]),
+      // A node the anchor did delegate, but its delegation is not on the list.
+      rawList(b, node2, asEvidence(b.delegation)),
+      // The right node, delegated for another purpose.
+      rawList(b, b.node, asEvidence(delegateSigner(b.anchor, pub(b.node), 'kin.vouch'))),
+      // The right node, with no evidence, or evidence that is not a list of delegations.
+      rawList(b, b.node, undefined),
+      rawList(b, b.node, { type: DELEGATION_EVIDENCE_TYPE, delegation: b.delegation }),
+      rawList(b, b.node, [{ type: 'Bond', delegation: b.delegation }]),
+    ];
+    for (const l of lists) expect(verifyPresentation(ok, holding(b, l))).toEqual(refused('no_status_list'));
+    expect(verifyPresentation(ok, holding(b, rawList(b, b.node, asEvidence(b.delegation)))).ok).toBe(true);
+  });
+
+  test('no_status_list: the vouch points at a list other than the entry\'s', () => {
+    const other = 'https://hillside.example.edu.au/status/2';
+    const c = vouch(b, mia, { entry: { ...b.entry, statusList: other } });
+    const lists = { [b.statusList]: b.list(), [other]: b.list() };
+    expect(verifyPresentation(show(c, mia), gate(b, { statusLists: lists }))).toEqual(refused('no_status_list'));
+  });
+
+  test('no_status_list comes before node_not_delegated, claim_not_allowed and the dates', () => {
+    const rogue = key('rogue-node');
+    const roguish = issueVouch({
+      nodeSk: rogue,
+      entry: { ...b.entry, periodEnds: ['2026-11-01T00:00:00Z'] },
+      subject: didKeyOfSecret(mia),
+      claim: 'member',
+      statusIndex: 7,
+      validFrom: '2026-10-01T00:00:00Z',
+      validUntil: '2026-11-01T00:00:00Z',
+    });
+    expect(verifyPresentation(show(roguish, mia), gate(b, { statusLists: {} }))).toEqual(refused('no_status_list'));
+    expect(verifyPresentation(show(roguish, mia), gate(b))).toEqual(refused('node_not_delegated'));
+  });
+
+  test('node_not_delegated: a vouch from a node the list does not carry', () => {
+    const rogue = key('rogue-node');
+    const c = vouch(b, mia, { nodeSk: rogue });
     expect(verifyPresentation(show(c, mia), gate(b))).toEqual(refused('node_not_delegated'));
+  });
+
+  test('node_not_delegated: a delegation on the list from another anchor, or for another purpose, does not count', () => {
+    const rogue = key('rogue-node');
+    const c = vouch(b, mia, { nodeSk: rogue });
+    const l = rawList(
+      b,
+      b.node,
+      asEvidence(b.delegation, delegateSigner(impostor, pub(rogue), BODY_VOUCH_PURPOSE), delegateSigner(b.anchor, pub(rogue), 'kin.vouch')),
+    );
+    expect(verifyPresentation(show(c, mia), holding(b, l))).toEqual(refused('node_not_delegated'));
+  });
+
+  test('node_not_delegated: a node whose delegation was dropped; the remaining node still passes', () => {
+    const node2 = key(`${SCHOOL.label}/node-2`);
+    const d2 = delegateSigner(b.anchor, pub(node2), BODY_VOUCH_PURPOSE);
+    const theo = holder('theo');
+    const fromNode2 = vouch(b, theo, { nodeSk: node2, statusIndex: 9 });
+    const dropped = b.list([], node2, [d2]);
+    expect(verifyPresentation(ok, holding(b, dropped))).toEqual(refused('node_not_delegated'));
+    expect(verifyPresentation(show(fromNode2, theo), holding(b, dropped)).ok).toBe(true);
+  });
+
+  test('node_not_delegated comes before claim_not_allowed and the dates', () => {
+    const rogue = key('rogue-node');
+    const c = issueVouch({
+      nodeSk: rogue,
+      entry: { ...b.entry, claims: ['age_over_18'], periodEnds: ['2026-11-01T00:00:00Z'] },
+      subject: didKeyOfSecret(mia),
+      claim: 'age_over_18',
+      statusIndex: 7,
+      validFrom: '2026-10-01T00:00:00Z',
+      validUntil: '2026-11-01T00:00:00Z',
+    });
+    expect(verifyPresentation(show(c, mia), gate(b, { require: 'age_over_18' }))).toEqual(refused('node_not_delegated'));
   });
 
   test('claim_not_allowed: a claim, or an expiry, the registry does not list', () => {
@@ -251,13 +367,6 @@ describe('the gate refuses, each for its own reason', () => {
   test('expired: past its period end while the body is still registered', () => {
     const later = at(END_2026) + 60;
     expect(verifyPresentation(show(cred, mia, later), gate(b, { now: later }))).toEqual(refused('expired'));
-  });
-
-  test('no_status_list: none held, or one not signed by the body', () => {
-    expect(verifyPresentation(ok, gate(b, { statusLists: {} }))).toEqual(refused('no_status_list'));
-    const rogue = key('rogue-node');
-    const rogueList = b.list([], rogue, delegateSigner(impostor, pub(rogue), BODY_VOUCH_PURPOSE));
-    expect(verifyPresentation(ok, gate(b, { statusLists: { [b.statusList]: rogueList } }))).toEqual(refused('no_status_list'));
   });
 
   test('withdrawn: the withdrawn index is refused, its sibling is not', () => {
@@ -281,11 +390,11 @@ describe('the gate refuses, each for its own reason', () => {
       'bad_credential',
       'subject_mismatch',
       'not_registered',
+      'no_status_list',
       'node_not_delegated',
       'claim_not_allowed',
       'not_yet_valid',
       'expired',
-      'no_status_list',
       'withdrawn',
       'missing_claim',
     ]);
@@ -306,12 +415,28 @@ describe('issuing refuses', () => {
     expect(() => vouch(b, mia, { validUntil: at(END_2026) })).not.toThrow();
   });
 
-  test('a delegation that does not verify, is not from the anchor, is not for this node, or has the wrong purpose', () => {
-    const tampered = { ...b.delegation, signature: delegateSigner(b.anchor, pub(key('other-node')), BODY_VOUCH_PURPOSE).signature };
-    expect(() => vouch(b, mia, { delegation: tampered })).toThrow('does not verify');
-    expect(() => vouch(b, mia, { delegation: delegateSigner(impostor, pub(b.node), BODY_VOUCH_PURPOSE) })).toThrow('not from the registered anchor');
-    expect(() => vouch(b, mia, { delegation: delegateSigner(b.anchor, pub(key('other-node')), BODY_VOUCH_PURPOSE) })).toThrow('not for this node');
-    expect(() => vouch(b, mia, { delegation: delegateSigner(b.anchor, pub(b.node), 'kin.vouch') })).toThrow('purpose');
+  test('a vouch carries no delegation: that travels on the list', () => {
+    const p = payloadOf(vouch(b, mia));
+    expect(p).not.toHaveProperty('evidence');
+    expect(Object.keys(p)).toEqual(['@context', 'type', 'issuer', 'validFrom', 'validUntil', 'credentialSubject', 'credentialStatus']);
+  });
+
+  test('a list carries every delegation given, in order, as evidence', () => {
+    const node2 = key(`${SCHOOL.label}/node-2`);
+    const d2 = delegateSigner(b.anchor, pub(node2), BODY_VOUCH_PURPOSE);
+    expect(payloadOf(b.list([], node2, [d2, b.delegation])).evidence).toEqual(asEvidence(d2, b.delegation));
+  });
+
+  test('a list whose delegations do not verify, have the wrong purpose, leave out its signer, mix anchors or repeat a node', () => {
+    const node2 = key(`${SCHOOL.label}/node-2`);
+    const d2 = delegateSigner(b.anchor, pub(node2), BODY_VOUCH_PURPOSE);
+    const tampered = { ...b.delegation, signature: d2.signature };
+    expect(() => b.list([], b.node, [])).toThrow('bad_delegation');
+    expect(() => b.list([], b.node, [tampered])).toThrow('does not verify');
+    expect(() => b.list([], b.node, [delegateSigner(b.anchor, pub(b.node), 'kin.vouch')])).toThrow('purpose');
+    expect(() => b.list([], b.node, [d2])).toThrow('signing node');
+    expect(() => b.list([], b.node, [b.delegation, delegateSigner(impostor, pub(node2), BODY_VOUCH_PURPOSE)])).toThrow('one anchor');
+    expect(() => b.list([], b.node, [b.delegation, b.delegation])).toThrow('one delegation per node');
   });
 
   test('a subject that is not a did:key, and an index off the list', () => {
@@ -352,24 +477,44 @@ describe('pairwise identifiers', () => {
   });
 });
 
-describe('node rotation', () => {
-  test('a new node works, the old node\'s credentials still verify, a forged delegation does not', () => {
-    const b = body(SCHOOL);
-    const mia = holder('mia');
-    const oldCred = vouch(b, mia, { statusIndex: 3 });
-    const node2 = key(`${SCHOOL.label}/node-2`);
-    const delegation2 = delegateSigner(b.anchor, pub(node2), BODY_VOUCH_PURPOSE);
-    const theo = holder('theo');
-    const newCred = vouch(b, theo, { nodeSk: node2, delegation: delegation2, statusIndex: 4 });
-    // After rotation the new node publishes the list.
-    const lists = { [b.statusList]: b.list([], node2, delegation2) };
-    expect(verifyPresentation(show(newCred, theo), gate(b, { statusLists: lists })).ok).toBe(true);
-    expect(verifyPresentation(show(oldCred, mia), gate(b, { statusLists: lists })).ok).toBe(true);
+describe('node rotation and withdrawal', () => {
+  const b = body(SCHOOL);
+  const mia = holder('mia');
+  const theo = holder('theo');
+  const oldCred = vouch(b, mia, { statusIndex: 3 });
+  const node2 = key(`${SCHOOL.label}/node-2`);
+  const d2 = delegateSigner(b.anchor, pub(node2), BODY_VOUCH_PURPOSE);
+  const newCred = vouch(b, theo, { nodeSk: node2, statusIndex: 4 });
 
+  test('the new node signs the list, which carries both delegations: both nodes\' vouches pass', () => {
+    const both = b.list([], node2, [d2, b.delegation]);
+    expect(verifyPresentation(show(newCred, theo), holding(b, both)).ok).toBe(true);
+    expect(verifyPresentation(show(oldCred, mia), holding(b, both)).ok).toBe(true);
+    // The old node may still sign it while both are honoured.
+    expect(verifyPresentation(show(newCred, theo), holding(b, b.list([], b.node, [b.delegation, d2]))).ok).toBe(true);
+    // Withdrawal still works per vouch, whichever node signed it.
+    const lists = b.list([3], node2, [d2, b.delegation]);
+    expect(verifyPresentation(show(oldCred, mia), holding(b, lists))).toEqual(refused('withdrawn'));
+    expect(verifyPresentation(show(newCred, theo), holding(b, lists)).ok).toBe(true);
+  });
+
+  test('withdrawing the old node: its delegation is dropped and the list signed again; its vouches fail, the new node\'s pass', () => {
+    const retired = b.list([], node2, [d2]);
+    expect(verifyPresentation(show(oldCred, mia), holding(b, retired))).toEqual(refused('node_not_delegated'));
+    expect(verifyPresentation(show(newCred, theo), holding(b, retired)).ok).toBe(true);
+    // The retired node cannot sign the list any more: it is not on it.
+    const byOld = rawList(b, b.node, asEvidence(d2));
+    expect(verifyPresentation(show(newCred, theo), holding(b, byOld))).toEqual(refused('no_status_list'));
+  });
+
+  test('a node an impostor delegated is refused, even on a list it signed itself', () => {
     const evilNode = key('evil-node');
     const forged = delegateSigner(impostor, pub(evilNode), BODY_VOUCH_PURPOSE);
-    const forgedCred = vouch(b, mia, { nodeSk: evilNode, delegation: forged, entry: { ...b.entry, anchor: pub(impostor) } });
-    expect(verifyPresentation(show(forgedCred, mia), gate(b, { statusLists: lists }))).toEqual(refused('node_not_delegated'));
+    const forgedCred = vouch(b, mia, { nodeSk: evilNode });
+    const both = b.list([], node2, [d2, b.delegation]);
+    expect(verifyPresentation(show(forgedCred, mia), holding(b, both))).toEqual(refused('node_not_delegated'));
+    const own = b.list([], evilNode, [forged]);
+    expect(verifyPresentation(show(forgedCred, mia), holding(b, own))).toEqual(refused('no_status_list'));
   });
 });
 

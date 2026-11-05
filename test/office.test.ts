@@ -12,14 +12,17 @@ import { PrivateKey } from '@bsv/sdk';
 import {
   type BodyClaim,
   decodeStatusList,
+  didKeyOf,
   didKeyOfSecret,
   fromB64url,
   fromUtf8,
   present,
+  readDelegation,
   readRegistryEntry,
   relationshipKey,
   signJwt,
   statusListBit,
+  verifyJwtByKid,
   verifyPresentation,
 } from '../src';
 import {
@@ -611,10 +614,24 @@ describe('the state file', () => {
     expect(statSync(o.path).mode & 0o777).toBe(0o600);
     expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
     const s = JSON.parse(readFileSync(o.path, 'utf8'));
-    expect(s).toMatchObject({ version: 1, did: DID, baseUrl: BASE, anchor: anchor.toPublicKey().toString(), nextStatusIndex: 0 });
+    expect(s).toMatchObject({ version: 2, did: DID, baseUrl: BASE, anchor: anchor.toPublicKey().toString(), nextStatusIndex: 0 });
     expect(s.nodeKey).toMatch(/^[0-9a-f]{64}$/);
+    // The current node's delegation, and the list carries it.
+    const node = PrivateKey.fromString(s.nodeKey, 16).toPublicKey().toString();
+    expect(s.delegations.map(readDelegation)).toEqual([{ anchor: anchor.toPublicKey().toString(), node, purpose: 'body.vouch' }]);
+    expect(s).not.toHaveProperty('delegation');
+    const list = verifyJwtByKid(s.statusList);
+    expect(list?.signer).toBe(didKeyOf(node));
+    expect(list?.payload.evidence).toEqual([{ type: 'SigningNodeDelegation', delegation: s.delegations[0] }]);
     expect(readRegistryEntry(s.registryEntry)?.steward).toBe(didKeyOfSecret(steward));
     expect(s.roster).toEqual([{ id: 'x', kind: 'member', label: 'X', consent: false }]);
+  });
+
+  test('a version 1 file, whose delegation went in every vouch, is refused', () => {
+    const o = makeOffice('state-v1');
+    const { delegations, ...s } = JSON.parse(readFileSync(o.path, 'utf8'));
+    writeFileSync(o.path, JSON.stringify({ ...s, version: 1, delegation: delegations[0] }));
+    expect(() => fileStore(o.path).load()).toThrow('version 2');
   });
 
   test('a steward that is the body\'s own anchor is refused', () => {

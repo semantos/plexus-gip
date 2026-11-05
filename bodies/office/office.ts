@@ -288,12 +288,12 @@ export class Office {
     return PrivateKey.fromString(s.nodeKey, 16);
   }
 
-  /** Sign the withdrawal list again from the vouches withdrawn. */
+  /** Sign the withdrawal list again, from the vouches withdrawn and the delegations honoured. */
   private resign(s: OfficeState, now: number): void {
     const revoked = s.vouches.filter((v) => v.withdrawnAt !== undefined).map((v) => v.statusIndex);
     s.statusList = issueStatusList(this.node(s), {
       issuer: s.did,
-      delegation: s.delegation,
+      delegations: s.delegations,
       url: this.entry(s).statusList,
       revoked,
       validFrom: now,
@@ -378,7 +378,8 @@ export class Office {
 
   /**
    * The vouch, about the key that signed the proof. A subject that collected
-   * with this code before gets the same vouch again and uses no place.
+   * with this code before gets the same vouch again, signed by the current
+   * node, and uses no place.
    */
   redeem(code: string, proof: unknown): { credential: string } {
     return this.write((s, now) => {
@@ -389,7 +390,6 @@ export class Office {
         try {
           return issueVouch({
             nodeSk: this.node(s),
-            delegation: s.delegation,
             entry,
             subject: v.subject,
             claim: v.claim,

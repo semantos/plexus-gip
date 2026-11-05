@@ -4,7 +4,8 @@
  *
  * It holds the body's node key, so it is a secret. It holds the roster, the
  * only place the office keeps a name. The anchor's private key is never in it:
- * the anchor signs the node's delegation at init and goes back in the safe.
+ * the anchor signs a node's delegation, at init and at each new node, and goes
+ * back in the safe.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -24,7 +25,8 @@ import {
   readRegistryEntry,
 } from '../../src';
 
-export const OFFICE_STATE_VERSION = 1;
+/** 2: the delegations travel on the withdrawal list, not in each vouch. */
+export const OFFICE_STATE_VERSION = 2;
 
 export type RosterKind = 'member' | 'guardian';
 
@@ -46,7 +48,7 @@ export interface RosterRow {
   sponsorNote?: boolean;
 }
 
-/** A vouch the node signed, with enough to sign it again byte for byte. */
+/** A vouch the node signed, with enough to sign it again: byte for byte while the node is the same. */
 export interface IssuedVouch {
   statusIndex: number;
   rosterId: string;
@@ -83,10 +85,14 @@ export interface OfficeState {
   baseUrl: string;
   /** The anchor's public key, compressed hex. */
   anchor: string;
-  /** The signing node's private key, hex. */
+  /** The signing node's private key, hex. An older node's key is not kept. */
   nodeKey: string;
-  /** The anchor's delegation of the node, for body.vouch. */
-  delegation: Association;
+  /**
+   * The anchor's delegations the body honours, for body.vouch: the current
+   * node's first, then any older node's whose vouches are still to pass. The
+   * withdrawal list carries them all, and is signed again whenever they change.
+   */
+  delegations: Association[];
   /** The steward-signed registry entry JWT. */
   registryEntry: string;
   /** True when the entry was signed here with a local steward key: a pilot only. */
@@ -131,7 +137,8 @@ export function writeAtomic(path: string, text: string): void {
 function parseState(text: string): OfficeState {
   const s = JSON.parse(text);
   if (s?.version !== OFFICE_STATE_VERSION) throw new WireError('bad_state', `not an office state file, version ${OFFICE_STATE_VERSION}`);
-  for (const k of ['roster', 'vouches', 'pickups']) if (!Array.isArray(s[k])) throw new WireError('bad_state', `${k} is missing`);
+  for (const k of ['roster', 'vouches', 'pickups', 'delegations']) if (!Array.isArray(s[k])) throw new WireError('bad_state', `${k} is missing`);
+  if (s.delegations.length === 0) throw new WireError('bad_state', 'no delegation for the current node');
   return s;
 }
 
@@ -241,7 +248,7 @@ export function initState(o: InitOptions): { state: OfficeState; token: string }
     throw new WireError('bad_entry', 'the office vouches member and guardian_of_member, and the entry lists neither');
   }
   const node = PrivateKey.fromRandom();
-  const delegation = delegateSigner(o.anchorSk, node.toPublicKey().toString(), BODY_VOUCH_PURPOSE);
+  const delegations = [delegateSigner(o.anchorSk, node.toPublicKey().toString(), BODY_VOUCH_PURPOSE)];
   const token = newToken();
   const state: OfficeState = {
     version: OFFICE_STATE_VERSION,
@@ -249,10 +256,10 @@ export function initState(o: InitOptions): { state: OfficeState; token: string }
     baseUrl,
     anchor,
     nodeKey: node.toHex(),
-    delegation,
+    delegations,
     registryEntry,
     pilotSteward: !('entry' in o),
-    statusList: issueStatusList(node, { issuer: o.did, delegation, url: entry.statusList, revoked: [], validFrom: o.now }),
+    statusList: issueStatusList(node, { issuer: o.did, delegations, url: entry.statusList, revoked: [], validFrom: o.now }),
     tokenHash: hashToken(token),
     roster: [],
     vouches: [],

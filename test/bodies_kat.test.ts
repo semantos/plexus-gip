@@ -7,10 +7,13 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildBodiesKat, KAT_PATH } from '../scripts/gen-bodies-kat';
+import { buildBodiesKat, KAT_PATH, katKey } from '../scripts/gen-bodies-kat';
 import {
   type BodyVerdict,
+  fromB64url,
+  fromUtf8,
   hex,
+  issueStatusList,
   publicKeyFromDidKey,
   readDelegation,
   readRegistryEntry,
@@ -46,13 +49,40 @@ describe('bodies known answers', () => {
 
   test('each piece reads back on its own', () => {
     expect(readRegistryEntry(KAT.registryEntry)?.steward).toBe(KAT.parties.steward);
-    expect(readDelegation(KAT.delegation)).toEqual({
-      anchor: KAT.parties.anchor,
-      node: hex(publicKeyFromDidKey(KAT.parties.node)),
-      purpose: 'body.vouch',
-    });
-    expect(verifyJwtByKid(KAT.vouch)?.signer).toBe(KAT.parties.node);
-    expect(verifyJwtByKid(KAT.statusList.jwt)?.signer).toBe(KAT.parties.node);
+    expect(KAT.statusList.delegations.map(readDelegation)).toEqual(
+      [KAT.parties.listNode, KAT.parties.node].map((n) => ({
+        anchor: KAT.parties.anchor,
+        node: hex(publicKeyFromDidKey(n)),
+        purpose: 'body.vouch',
+      })),
+    );
+    const vouch = verifyJwtByKid(KAT.vouch);
+    expect(vouch?.signer).toBe(KAT.parties.node);
+    expect(vouch?.payload).not.toHaveProperty('evidence');
+    const list = verifyJwtByKid(KAT.statusList.jwt);
+    expect(list?.signer).toBe(KAT.parties.listNode);
+    expect(list?.payload.evidence).toEqual(
+      KAT.statusList.delegations.map((delegation: unknown) => ({ type: 'SigningNodeDelegation', delegation })),
+    );
     expect(verifyJwtByKid(KAT.presentation, 'vp+jwt')?.signer).toBe(KAT.parties.subject);
+  });
+
+  test('with node-1\'s delegation off the list, the same vouch is node_not_delegated', () => {
+    const o = KAT.verify.options;
+    const p = JSON.parse(fromUtf8(fromB64url(KAT.statusList.jwt.split('.')[1])));
+    const retired = issueStatusList(katKey('hillside/node-2'), {
+      issuer: p.issuer,
+      delegations: KAT.statusList.delegations.slice(0, 1),
+      url: KAT.statusList.url,
+      revoked: KAT.statusList.revoked,
+      validFrom: p.validFrom,
+    });
+    const got = verifyPresentation(KAT.presentation, {
+      ...o,
+      stewards: new Set(o.stewards),
+      registryEntries: [KAT.registryEntry],
+      statusLists: { [KAT.statusList.url]: retired },
+    });
+    expect(got).toEqual({ ok: false, reason: 'node_not_delegated' });
   });
 });

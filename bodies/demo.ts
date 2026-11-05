@@ -112,7 +112,6 @@ function runPilot(p: Pilot): void {
   console.log(`${' '.repeat(lead.length)}${JSON.stringify(p.records.parent)}`);
   const childCred = issueVouch({
     nodeSk: node,
-    delegation,
     entry,
     subject: didKeyOfSecret(childSk),
     claim: 'member',
@@ -122,7 +121,6 @@ function runPilot(p: Pilot): void {
   });
   const parentCred = issueVouch({
     nodeSk: node,
-    delegation,
     entry,
     subject: didKeyOfSecret(parentSk),
     claim: 'guardian_of_member',
@@ -141,7 +139,7 @@ function runPilot(p: Pilot): void {
   console.log(`  any name, birthdate or record number inside? ${leaked.length === 0 ? 'none ' + ok(true) : leaked.join(', ') + ' ' + ok(false)}`);
 
   h('[5] The node publishes the withdrawal list (16 KiB of bits, fetched whole)');
-  const lists = { [statusUrl]: issueStatusList(node, { issuer: p.did, delegation, url: statusUrl, revoked: [], validFrom: now - 60 }) };
+  const lists = { [statusUrl]: issueStatusList(node, { issuer: p.did, delegations: [delegation], url: statusUrl, revoked: [], validFrom: now - 60 }) };
   console.log(`  ${statusUrl}   nothing withdrawn`);
 
   const gate = (statusLists: Record<string, string>, require: BodyClaim, n: string) => ({
@@ -167,7 +165,7 @@ function runPilot(p: Pilot): void {
   console.log(`  the gate contacted ${host}: never`);
 
   h(`[7] The child leaves; ${p.name} withdraws index 101`);
-  const after = { [statusUrl]: issueStatusList(node, { issuer: p.did, delegation, url: statusUrl, revoked: [101], validFrom: now - 30 }) };
+  const after = { [statusUrl]: issueStatusList(node, { issuer: p.did, delegations: [delegation], url: statusUrl, revoked: [101], validFrom: now - 30 }) };
   const n3 = nonce();
   const v3 = verifyPresentation(present({ credentialJwt: childCred, subjectSk: childSk, audience: GATE, nonce: n3, at: now }), gate(after, 'member', n3));
   console.log(`  child asks in again → ${v3.ok ? 'ok' : `refused: ${v3.reason}`} ${ok(!v3.ok)}`);
