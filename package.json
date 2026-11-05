@@ -11,7 +11,11 @@
     "portal:demo": "bun portal/demo.ts",
     "portal:server": "bun portal/server.ts",
     "familysearch:demo": "bun familysearch/demo.ts",
-    "delegation:demo": "bun delegation-demo.ts"
+    "delegation:demo": "bun delegation-demo.ts",
+    "test": "bun test",
+    "bodies:demo": "bun bodies/demo.ts",
+    "bodies:kat": "bun scripts/gen-bodies-kat.ts",
+    "office": "bun bodies/office/cli.ts"
   },
   "dependencies": {
     "@bsv/sdk": "^2.0.0"

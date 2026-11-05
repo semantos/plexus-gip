@@ -5,6 +5,8 @@
  * standing in for `@semantos/protocol-types/identity` in the full monorepo. The
  * module sources under `src/` are unmodified copies; only this barrel and the
  * two runnable entry points (`walkthrough.ts`, `cli.ts`) are kit-specific.
+ * The exception is `src/bodies/`, written for this kit; its wire formats are
+ * ported from the bitpiggy wire package.
  */
 
 // Edge substrate — identity as a set of signed associations (merkle-committed).
@@ -137,3 +139,80 @@ export {
   proveNumericPredicate,
   verifyNumericPredicate,
 } from './zk/numeric-predicate';
+
+// Any accountable body as attestor — a school, club, scout group, parish, sports
+// club, employer or professional body vouches one fact about a member's pairwise
+// key; a relying party checks it offline against a steward-signed registry and
+// the body's withdrawal list. W3C VC 2.0 as ES256K JWTs, did:web / did:key.
+export {
+  BODIES_CONTEXT,
+  BODY_CLAIMS,
+  BODY_KINDS,
+  BODY_REFUSALS,
+  BODY_VOUCH_PURPOSE,
+  BODY_VOUCH_TYPE,
+  DELEGATION_EVIDENCE_TYPE,
+  EDGE_CREATION,
+  PRESENTATION_MAX_SKEW,
+  BODY_VOUCH_OFFICE,
+  REGISTRY_ENTRY_TYPE,
+  STATUS_LIST_TYPE,
+  type BodyClaim,
+  type BodyKind,
+  type BodyRefusal,
+  type BodyVerdict,
+  type DidWebOptions,
+  type Instant,
+  type PresentInput,
+  type RegistryEntry,
+  type RegistryEntryInput,
+  type StatusListInput,
+  type VerifyPresentationOptions,
+  type VouchInput,
+  didKeyOf,
+  didWebDocumentUrl,
+  didWebHost,
+  didWebPath,
+  isoSeconds,
+  issueRegistryEntry,
+  issueStatusList,
+  issueVouch,
+  parseIsoSeconds,
+  present,
+  readRegistryEntry,
+  relationshipKey,
+  verifyPresentation,
+  vouchOfficeOf,
+} from './bodies';
+
+// The wire formats under it, ported from the bitpiggy wire package: did:key for
+// secp256k1, ES256K JWTs (64-byte r||s, low-S) and Bitstring Status Lists.
+export {
+  STATUS_LIST_BITS,
+  VC_CONTEXT,
+  WireError,
+  type JwtHeader,
+  type JwtTyp,
+  type SignedJwt,
+  type VerifiedJwt,
+  b64url,
+  base58btc,
+  decodeStatusList,
+  didKeyFromPublicKey,
+  didKeyOfSecret,
+  encodeStatusList,
+  es256kSign,
+  es256kVerify,
+  fromB64url,
+  fromBase58btc,
+  fromHex,
+  fromUtf8,
+  hex,
+  keyIdFor,
+  publicKeyFromDidKey,
+  signJwt,
+  statusListBit,
+  utf8,
+  verifyJwt,
+  verifyJwtByKid,
+} from './bodies';

@@ -62,6 +62,26 @@ Because the production node key (`deriveOrgNodeSk`) is a *keyed* child of the or
 tier-0 (deliberately unlinkable), the relationship can't be derived from public keys
 — so it's proven by a **signed delegation**, not a derivation check.
 
+## Any body as attestor (`src/bodies/`)
+
+A school, club, scout group, parish, sports club, employer or professional body
+confirms one fact about a member from its own records (`member`,
+`guardian_of_member`, `age_over_13/16/18` or `helper`) and signs a W3C VC 2.0
+credential, an ES256K JWT, about a did:key the member's wallet made for one
+platform only. No name, birthdate or record number goes in it. The platform
+checks it offline: the holder's answer to its challenge, the body's entry in a
+steward-signed registry, and the body's withdrawal list, which also carries the
+anchor's delegation of each signing node the body honours. The credential
+carries no delegation, so it stays small, and a node can be withdrawn. See
+[`docs/GIP-V2-BODY-ATTESTATION.md`](docs/GIP-V2-BODY-ATTESTATION.md).
+
+```bash
+bun bodies/demo.ts   # a school, then a scout group, through the same code
+bun test             # every refusal, the known-answer file, the ported wire formats
+```
+
+`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json`, which names the office. A device collects its vouches there with `POST /collect`: signed again after a new node, and each later period's vouch with no new code; `didWebDocumentUrl` and `vouchOfficeOf` find the office from the body's did:web (`bun run office init`, then `serve`; `rotate-node` and `retire-node` move to a new signing node and withdraw an old one; see the doc's §6).
+
 ## Paid-attestation portal (prototype)
 
 FamilySearch can **charge to issue** an attestation over an x402-style `402`
@@ -142,5 +162,6 @@ The `docs/` folder carries the "why", not just the "how":
   protocol, for reading and running.
 - The `src/` modules are carved copies from semantos-core (the Plexus/Semantos
   monorepo); the kit-specific pieces are this README, the `src/index.ts` barrel,
-  `walkthrough.ts`, `cli.ts`, `sign.ts`, `delegation-demo.ts`, and the `portal/`
-  and `familysearch/` entry points.
+  `walkthrough.ts`, `cli.ts`, `sign.ts`, `delegation-demo.ts`, the `portal/`
+  and `familysearch/` entry points, and `src/bodies/` with `bodies/demo.ts` and
+  `bodies/office/`.
