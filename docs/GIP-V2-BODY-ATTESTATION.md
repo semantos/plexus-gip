@@ -162,7 +162,22 @@ id (the tests scan them).
 
 - **The desk**, behind a bearer token stored hashed: add rows, record consent,
   vouch a class, withdraw a family (with a "guardian may sponsor onward" note),
-  and `GET /desk/needs`, the home list of what needs the school.
+  `GET /desk/needs`, the home list of what needs the school (its counts split
+  the rows vouched into members and guardians), and `GET /desk/standing`,
+  where the body stands: the registry entry as its steward signed it (did,
+  kind, claims, period ends, the steward, whether it is a pilot's own, when it
+  holds), the DID document's place, the anchor, the signing node and every
+  node the list honours, and the withdrawal list (its URL, when the list now
+  published was signed, and how many places it marks withdrawn).
+- **The desk's origin.** The registrar's desk is the vouch cartridge in the
+  Helm (semantos-core `packages/vouch_experience`), a page on the brain's
+  origin, so `serve --desk-origin <origin>[,<origin>]` (or
+  `$OFFICE_DESK_ORIGIN`) names the origins a browser may call `/desk/*` from.
+  A preflight from one gets the route's methods and the `authorization`
+  header; any other is 403 `origin_not_allowed`; an answer to one carries it,
+  with `Vary: Origin`. This is CORS, not a lock: every desk route still wants
+  the token, from any origin. Moving the desk behind the brain's Helm login,
+  with no office token in the browser, is the next step.
 - **Pickup.** Vouching a consented row makes a one-time 128-bit code, good for
   seven days or to the period end. The parent's phone reads what the body will
   and will not say, then each app's key collects its own vouch with a proof
@@ -210,3 +225,19 @@ id (the tests scan them).
   each change of node, `/pickup/<code>` and `POST /collect`. A pilot may sign
   its own entry with a local steward key; `init` warns that a body must not
   steward itself.
+- **Where it runs** (Todd's decision, 5 November 2026). Each attestor gets a
+  semantos brain from the operator, with the workspace cartridge as its home,
+  and its office runs beside that brain on the same host in Australia, behind
+  the same Caddy: not inside the brain, and not on Cloudflare, since it holds
+  the node key and the children's names. `bodies/office/deploy/` has the
+  recipe: `vouch-office@.service`, one instance per attestor, runs
+  `bun --no-install run bodies/office/cli.ts serve` on 127.0.0.1 with its
+  state in `/var/lib/vouch-office/<attestor>/` (0700) and its port and desk
+  origin from `/etc/vouch-office/<attestor>.env`, which holds no secret; the
+  `Caddyfile` site serves `/.well-known/did.json`, `/status/*`, `/pickup/*`
+  and `/collect` to everyone, `/desk/*` only with the desk's `Origin` (and
+  `remote_ip` can hold it to the school's network), 404 for the rest, and
+  keeps no access log, since a pickup URL is a secret until it is used. Its
+  README covers init with the anchor key kept offline, a DID document
+  published at the did's host when the office is elsewhere, and backups of
+  the state file, encrypted and in Australia.
