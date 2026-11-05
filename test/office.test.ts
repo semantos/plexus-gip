@@ -28,9 +28,11 @@ import {
   vouchOfficeOf,
 } from '../src';
 import {
+  COLLECT_NONCE,
   Office,
   PICKUP_MAX_SUBJECTS,
   PICKUP_TTL,
+  collectProof,
   fileStore,
   initState,
   officeHandler,
@@ -579,6 +581,261 @@ describe('pickups', () => {
         { id: 'nobody', reason: 'unknown_row' },
       ],
     });
+  });
+});
+
+describe('collecting', () => {
+  const o = makeOffice('collect');
+  const HOMEWORK = 'homework-club:online';
+  const LIBRARY = 'library:reading-log';
+  const codes: Record<string, string> = {};
+  const creds: Record<string, string> = {};
+  /** Every answer this block sees, for the names scan. */
+  const seen: string[] = [];
+  let entryJwt = '';
+
+  async function collect(sk: PrivateKey, proof: unknown = collectProof({ subjectSk: sk, body: DID, at: clock })) {
+    const r = await o.pub('POST', '/collect', { proof });
+    seen.push(r.text);
+    return r;
+  }
+  async function redeem(code: string, sk: PrivateKey) {
+    const r = await o.pub('POST', `/pickup/${code}`, { proof: pickupProof({ subjectSk: sk, body: DID, code, at: clock }) });
+    seen.push(r.text);
+    return r;
+  }
+  const list = async (): Promise<string> => (await o.pub('GET', '/status/1')).text;
+  const indexOf = (jwt: string): string => payloadOf(jwt).credentialStatus.statusListIndex;
+
+  test('the family picks up at the office, as before', async () => {
+    await o.desk('POST', '/desk/roster', { rows: ROSTER });
+    await o.desk('POST', '/desk/consent', { ids: ['HP-0042', 'HP-0043', 'HP-G-0042a'], consent: true });
+    const v = await o.desk('POST', '/desk/vouch', { ids: ['HP-0042', 'HP-0043', 'HP-G-0042a'] });
+    for (const p of v.json.pickups) codes[p.id] = codeOf(p.url);
+    entryJwt = (await o.pub('GET', `/pickup/${codes['HP-0042']}`)).json.registryEntry;
+    const got: [string, string, PrivateKey][] = [
+      ['mia', 'HP-0042', holder('mia')],
+      ['miaHomework', 'HP-0042', holder('mia', HOMEWORK)],
+      ['miaLibrary', 'HP-0042', holder('mia', LIBRARY)],
+      ['theo', 'HP-0043', holder('theo')],
+      ['sam', 'HP-G-0042a', holder('sam')],
+    ];
+    for (const [name, id, sk] of got) {
+      const r = await redeem(codes[id]!, sk);
+      expect(r.status).toBe(200);
+      creds[name] = r.json.credential;
+    }
+  });
+
+  test('a key collects its own live vouches and nothing else, and a collect writes nothing', async () => {
+    // A save renames a new file into place, so the inode says whether there was one.
+    const before = statSync(o.path).ino;
+    const r = await collect(holder('mia'));
+    expect(r.status).toBe(200);
+    expect(r.headers.get('access-control-allow-origin')).toBe('*');
+    expect(r.json).toEqual({ vouches: [creds.mia] });
+    expect((await collect(holder('mia', HOMEWORK))).json).toEqual({ vouches: [creds.miaHomework] });
+    expect((await collect(holder('theo'))).json).toEqual({ vouches: [creds.theo] });
+    expect((await collect(holder('sam'))).json).toEqual({ vouches: [creds.sam] });
+    expect(admit(r.json.vouches[0], holder('mia'), entryJwt, await list(), 'member')).toMatchObject({ ok: true });
+    expect(statSync(o.path).ino).toBe(before);
+  });
+
+  test('an unknown key, and one whose vouches are all withdrawn or ended, get the same empty list', async () => {
+    const stranger = await collect(holder('stranger'));
+    expect(stranger.status).toBe(200);
+    expect(stranger.json).toEqual({ vouches: [] });
+
+    clock += 60;
+    await o.desk('POST', '/desk/withdraw', { ids: ['HP-0043'] });
+    const theo = await collect(holder('theo'));
+    expect([theo.status, theo.text]).toEqual([200, stranger.text]);
+
+    clock = at(END_2026) - 1;
+    expect((await collect(holder('mia'))).json.vouches).toEqual([creds.mia]);
+    clock = at(END_2026);
+    const mia = await collect(holder('mia'));
+    expect([mia.status, mia.text]).toEqual([200, stranger.text]);
+  });
+
+  test('a stale, wrong-audience, wrong-nonce or malformed proof is refused', async () => {
+    const mia = holder('mia');
+    const proof = (over: { body?: string; nonce?: string; at?: number } = {}) =>
+      signJwt({ aud: over.body ?? DID, nonce: over.nonce ?? COLLECT_NONCE, iat: over.at ?? clock }, mia, 'openid4vci-proof+jwt');
+    expect(COLLECT_NONCE).toBe('collect');
+    expect(collectProof({ subjectSk: mia, body: DID, at: clock })).toBe(proof());
+    const tries: [unknown, string][] = [
+      [proof({ at: clock - 301 }), 'stale'],
+      [proof({ at: clock + 301 }), 'stale'],
+      [proof({ body: 'did:web:other.example.org' }), 'wrong_audience'],
+      [proof({ nonce: 'Collect' }), 'wrong_nonce'],
+      [proof({ nonce: 'collect ' }), 'wrong_nonce'],
+      [pickupProof({ subjectSk: mia, body: DID, code: codes['HP-0042']!, at: clock }), 'wrong_nonce'],
+      ['not-a-jwt', 'bad_proof'],
+      [present({ credentialJwt: 'x', subjectSk: mia, audience: DID, nonce: COLLECT_NONCE, at: clock }), 'bad_proof'],
+      [signJwt({ aud: DID, nonce: COLLECT_NONCE, iat: clock }, mia), 'bad_proof'],
+      [proof({ at: clock + 0.5 }), 'bad_proof'],
+      [undefined, 'bad_proof'],
+    ];
+    for (const [p, error] of tries) {
+      const r = await o.pub('POST', '/collect', p === undefined ? {} : { proof: p });
+      seen.push(r.text);
+      expect([r.status, r.json.error]).toEqual([400, error]);
+    }
+    expect((await collect(mia, proof({ at: clock - 300 }))).json.vouches).toEqual([creds.mia]);
+    // Nor does a collect proof pick up a code.
+    const code = codes['HP-0042']!;
+    const asPickup = await o.pub('POST', `/pickup/${code}`, { proof: proof() });
+    expect([asPickup.status, asPickup.json.error]).toEqual([400, 'wrong_nonce']);
+
+    const notJson = await o.h(new Request(`${BASE}/collect`, { method: 'POST', body: 'nope' }));
+    expect([notJson.status, (await notJson.json()).error]).toEqual([400, 'bad_json']);
+    const get = await o.pub('GET', '/collect');
+    expect([get.status, get.headers.get('allow')]).toEqual([405, 'POST']);
+    const pre = await call(o.h, 'OPTIONS', '/collect');
+    expect(pre.status).toBe(204);
+    expect(pre.headers.get('access-control-allow-origin')).toBe('*');
+    expect(pre.headers.get('access-control-allow-methods')).toBe('POST');
+  });
+
+  test('after a new node, a key collects the same vouch signed by the new node, and it passes the gate', async () => {
+    const { node } = o.office.rotateNode(anchor);
+    const r = await collect(holder('mia'));
+    expect(r.json.vouches).toHaveLength(1);
+    const v: string = r.json.vouches[0];
+    expect(v).not.toBe(creds.mia);
+    expect(verifyJwtByKid(v)?.signer).toBe(didKeyOf(node));
+    // Same subject, claim, place and dates: only the signature is new.
+    expect(payloadOf(v)).toEqual(payloadOf(creds.mia!));
+    expect(admit(v, holder('mia'), entryJwt, await list(), 'member')).toMatchObject({ ok: true });
+
+    // Once the old node is retired, the vouch held from before fails and the one collected passes.
+    o.office.retireNode(o.office.info().nodes[1]!);
+    const after = await list();
+    expect(admit(creds.mia!, holder('mia'), entryJwt, after, 'member')).toEqual({ ok: false, reason: 'node_not_delegated' });
+    expect(admit(v, holder('mia'), entryJwt, after, 'member')).toMatchObject({ ok: true });
+    for (const [name, sk] of [['mia', holder('mia')], ['miaHomework', holder('mia', HOMEWORK)], ['sam', holder('sam')]] as const) {
+      creds[name] = (await collect(sk)).json.vouches[0];
+    }
+  });
+
+  test('renewal: vouched again for 2027, each key holding the row\'s vouch collects 2027\'s with no code', async () => {
+    clock = NOW + 3 * 86400; // 2026-11-08T09:00:00Z
+    const v = await o.desk('POST', '/desk/vouch', { ids: ['HP-0042'], periodEnd: END_2027 });
+    const code = codeOf(v.json.pickups[0].url);
+    // A week and a day later the code has run out, and nobody has used it.
+    clock = NOW + 11 * 86400 + 3600; // 2026-11-16T10:00:00Z
+    expect((await o.pub('GET', `/pickup/${code}`)).json.error).toBe('expired');
+    // The home list knows the row is vouched for 2027: it is not lapsing; Sam's is.
+    const needs = await o.desk('GET', '/desk/needs');
+    expect(needs.json.lapsing.map((i: any) => i.id)).toEqual(['HP-G-0042a']);
+
+    const r = await collect(holder('mia'));
+    expect(r.json.vouches).toHaveLength(2);
+    const [next, current] = r.json.vouches as string[];
+    // This year's is still live: vouching for a later period cancels no vouch. Newest period first.
+    expect(current).toBe(creds.mia);
+    const p = payloadOf(next!);
+    expect(p).toMatchObject({ issuer: DID, validFrom: '2026-11-08T00:00:00Z', validUntil: END_2027 });
+    expect(p.credentialSubject).toEqual({ id: didKeyOfSecret(holder('mia')), member: true });
+    expect(verifyJwtByKid(next!)?.signer).toBe(didKeyOf(o.office.info().node));
+    const listJwt = await list();
+    expect(admit(next!, holder('mia'), entryJwt, listJwt, 'member')).toMatchObject({ ok: true });
+    expect(admit(current!, holder('mia'), entryJwt, listJwt, 'member')).toMatchObject({ ok: true });
+
+    // Issued at collect time, at a new place of its own.
+    const s = JSON.parse(readFileSync(o.path, 'utf8'));
+    const renewed = s.vouches.filter((x: any) => x.validUntil === END_2027);
+    expect(renewed).toEqual([
+      {
+        statusIndex: Number(indexOf(next!)),
+        rosterId: 'HP-0042',
+        claim: 'member',
+        subject: didKeyOfSecret(holder('mia')),
+        validFrom: '2026-11-08T00:00:00Z',
+        issuedAt: '2026-11-16T10:00:00Z',
+        validUntil: END_2027,
+      },
+    ]);
+    expect(s.vouches.filter((x: any) => x.statusIndex === renewed[0].statusIndex)).toHaveLength(1);
+
+    // Again: the same two, and no new place.
+    clock += 60;
+    expect((await collect(holder('mia'))).json.vouches).toEqual([next, current]);
+    expect(JSON.parse(readFileSync(o.path, 'utf8')).vouches).toHaveLength(s.vouches.length);
+
+    // The row's other keys get their own, each at its own place; another row's key gets nothing new.
+    const hw = await collect(holder('mia', HOMEWORK));
+    expect(hw.json.vouches).toHaveLength(2);
+    expect(hw.json.vouches[1]).toBe(creds.miaHomework);
+    expect(payloadOf(hw.json.vouches[0])).toMatchObject({ validUntil: END_2027, credentialSubject: { id: didKeyOfSecret(holder('mia', HOMEWORK)) } });
+    expect(indexOf(hw.json.vouches[0])).not.toBe(indexOf(next!));
+    expect((await collect(holder('sam'))).json.vouches).toEqual([creds.sam]);
+    creds.mia2027 = next!;
+    creds.miaHomework2027 = hw.json.vouches[0];
+  });
+
+  test('a lapsed vouch renews too: in 2027 a key that held only 2026\'s collects 2027\'s', async () => {
+    clock = at(END_2026) + 86400;
+    expect((await collect(holder('mia'))).json.vouches).toEqual([creds.mia2027]);
+    const lib = await collect(holder('mia', LIBRARY));
+    expect(lib.json.vouches).toHaveLength(1);
+    expect(payloadOf(lib.json.vouches[0])).toMatchObject({ validUntil: END_2027, credentialSubject: { id: didKeyOfSecret(holder('mia', LIBRARY)) } });
+    expect((await collect(holder('sam'))).json).toEqual({ vouches: [] });
+  });
+
+  test('without consent there is nothing new, and a withdrawn key is not renewed when its row is taken back', async () => {
+    clock = NOW + 12 * 86400;
+    await o.desk('POST', '/desk/vouch', { ids: ['HP-G-0042a'], periodEnd: END_2027 });
+    await o.desk('POST', '/desk/consent', { ids: ['HP-G-0042a'], consent: false });
+    expect((await collect(holder('sam'))).json.vouches).toEqual([creds.sam]);
+
+    // Theo was withdrawn. Taking his row back for 2027 renews nobody: his key needs the code.
+    const back = await o.desk('POST', '/desk/vouch', { ids: ['HP-0043'], periodEnd: END_2027 });
+    expect(back.json.pickups).toHaveLength(1);
+    expect((await collect(holder('theo'))).json).toEqual({ vouches: [] });
+    const r = await redeem(codeOf(back.json.pickups[0].url), holder('theo'));
+    expect(r.status).toBe(200);
+    expect((await collect(holder('theo'))).json).toEqual({ vouches: [r.json.credential] });
+  });
+
+  test('withdrawal stops both periods; taken back for 2026, the withdrawn 2027 vouch does not come back', async () => {
+    clock = NOW + 13 * 86400;
+    await o.desk('POST', '/desk/withdraw', { ids: ['HP-0042'] });
+    expect((await collect(holder('mia'))).json).toEqual({ vouches: [] });
+    const listJwt = await list();
+    for (const jwt of [creds.mia2027!, creds.mia!]) {
+      expect(admit(jwt, holder('mia'), entryJwt, listJwt, 'member')).toEqual({ ok: false, reason: 'withdrawn' });
+    }
+
+    clock += 60;
+    const back = await o.desk('POST', '/desk/vouch', { ids: ['HP-0042'] });
+    const r = await redeem(codeOf(back.json.pickups[0].url), holder('mia'));
+    expect(r.status).toBe(200);
+    expect(payloadOf(r.json.credential).validUntil).toBe(END_2026);
+    expect((await collect(holder('mia'))).json).toEqual({ vouches: [r.json.credential] });
+    // The other keys' vouches were withdrawn with the row, so they are not renewed either.
+    expect((await collect(holder('mia', HOMEWORK))).json).toEqual({ vouches: [] });
+
+    // Vouched for 2027 once more, the key holding the new vouch collects 2027's.
+    clock += 60;
+    await o.desk('POST', '/desk/vouch', { ids: ['HP-0042'], periodEnd: END_2027 });
+    const again = await collect(holder('mia'));
+    expect(again.json.vouches).toHaveLength(2);
+    expect(again.json.vouches[1]).toBe(r.json.credential);
+    expect(again.json.vouches[0]).not.toBe(creds.mia2027);
+    expect(payloadOf(again.json.vouches[0]).validUntil).toBe(END_2027);
+    expect(admit(again.json.vouches[0], holder('mia'), entryJwt, await list(), 'member')).toMatchObject({ ok: true });
+  });
+
+  test('names never leave: no answer to a collect, nor any vouch in one, carries a label, group or roster id', () => {
+    const texts: string[] = [];
+    for (const body of seen) {
+      texts.push(body);
+      for (const jwt of body.match(/eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+/g) ?? []) texts.push(JSON.stringify(payloadOf(jwt)));
+    }
+    for (const t of texts) for (const n of NAMES) expect(t).not.toContain(n);
+    expect(texts.filter((t) => t.includes(`"validUntil":"${END_2027}"`)).length).toBeGreaterThan(3);
   });
 });
 

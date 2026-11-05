@@ -77,6 +77,13 @@ export interface Pickup {
   /** Each subject that collected a vouch with this code, and its status index. */
   redeemed: { subject: string; statusIndex: number }[];
   cancelledAt?: string;
+  /**
+   * When the row was withdrawn. A pickup is also the registrar's word that
+   * the row is vouched for its period, which renews the row's holders at
+   * collect (a later period); a withdrawal ends that, and the row needs
+   * vouching again.
+   */
+  withdrawnAt?: string;
 }
 
 export interface OfficeState {

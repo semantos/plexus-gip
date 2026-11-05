@@ -7,6 +7,7 @@
  *     GET  /status/1                 the withdrawal list, a signed JWT
  *     GET  /pickup/:code             what the body will and will not say
  *     POST /pickup/:code {proof}     the vouch, about the key that signed the proof
+ *     POST /collect {proof}          every live vouch about the key that signed the proof
  *
  * The registrar's desk, with `Authorization: Bearer <token>`:
  *
@@ -47,6 +48,13 @@ function bearer(req: Request): string | null {
   if (h === null) return null;
   return /^Bearer ([A-Za-z0-9._~+/-]+=*)$/.exec(h)?.[1] ?? '';
 }
+
+/** The answer to a browser's preflight for a public route that takes JSON. */
+const preflight = (methods: string): Response =>
+  new Response(null, {
+    status: 204,
+    headers: { 'access-control-allow-methods': methods, 'access-control-allow-headers': 'content-type', 'access-control-max-age': '600' },
+  });
 
 function only(methods: string[], req: Request): void {
   if (!methods.includes(req.method)) throw new OfficeError(405, 'method_not_allowed', methods.join(', '));
@@ -98,15 +106,16 @@ async function route(office: Office, req: Request, path: string): Promise<Respon
 
   const code = /^\/pickup\/([^/]+)$/.exec(path)?.[1];
   if (code !== undefined) {
-    if (req.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: { 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type', 'access-control-max-age': '600' },
-      });
-    }
+    if (req.method === 'OPTIONS') return preflight('GET, POST');
     only(['GET', 'POST'], req);
     if (req.method === 'GET') return json(office.pickup(code));
     return json(office.redeem(code, (await bodyOf(req)).proof));
+  }
+
+  if (path === '/collect') {
+    if (req.method === 'OPTIONS') return preflight('POST');
+    only(['POST'], req);
+    return json(office.collect((await bodyOf(req)).proof));
   }
 
   throw new OfficeError(404, 'not_found');

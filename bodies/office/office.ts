@@ -49,8 +49,6 @@ import {
   newToken,
 } from './state';
 
-/** How long a pickup code lasts, in seconds. */
-
 /**
  * A random free place on the withdrawal list. Places handed out in order
  * would put one person's vouches for different apps side by side, and two
@@ -65,6 +63,7 @@ function unusedStatusIndex(vouches: readonly { statusIndex: number }[]): number 
   }
 }
 
+/** How long a pickup code lasts, in seconds. */
 export const PICKUP_TTL = 7 * 86400;
 
 /** How many subjects one pickup serves: one per app a family uses. */
@@ -106,6 +105,12 @@ export interface PickupProofInput {
 export function pickupProof(p: PickupProofInput): string {
   return signJwt({ aud: p.body, nonce: p.code, iat: p.at }, p.subjectSk, PICKUP_PROOF_TYP);
 }
+
+/** The nonce of a proof at collect. There is no code: the proof's iat keeps it fresh. */
+export const COLLECT_NONCE = 'collect';
+
+/** The holder's proof of its key when it collects its vouches: a pickup proof with the nonce `collect`. */
+export const collectProof = (p: Omit<PickupProofInput, 'code'>): string => pickupProof({ ...p, code: COLLECT_NONCE });
 
 /** The did:key that signed a proof for this body and code, now. */
 function proofSubject(proof: unknown, did: string, code: string, now: number): string {
@@ -307,6 +312,24 @@ export class Office {
     });
   }
 
+  /** A vouch the office issued, signed by the current node: byte for byte the same while the node is. */
+  private sign(s: OfficeState, v: IssuedVouch): string {
+    try {
+      return issueVouch({
+        nodeSk: this.node(s),
+        entry: this.entry(s),
+        subject: v.subject,
+        claim: v.claim,
+        statusIndex: v.statusIndex,
+        validFrom: v.validFrom,
+        validUntil: v.validUntil,
+      });
+    } catch (e) {
+      if (e instanceof WireError) throw new OfficeError(409, e.code);
+      throw e;
+    }
+  }
+
   /** Sign the withdrawal list again, from the vouches withdrawn and the delegations honoured. */
   private resign(s: OfficeState, now: number): void {
     const revoked = s.vouches.filter((v) => v.withdrawnAt !== undefined).map((v) => v.statusIndex);
@@ -409,25 +432,8 @@ export class Office {
     return this.write((s, now) => {
       const p = this.findPickup(s, code, now);
       const subject = proofSubject(proof, s.did, code, now);
-      const entry = this.entry(s);
-      const sign = (v: IssuedVouch): string => {
-        try {
-          return issueVouch({
-            nodeSk: this.node(s),
-            entry,
-            subject: v.subject,
-            claim: v.claim,
-            statusIndex: v.statusIndex,
-            validFrom: v.validFrom,
-            validUntil: v.validUntil,
-          });
-        } catch (e) {
-          if (e instanceof WireError) throw new OfficeError(409, e.code);
-          throw e;
-        }
-      };
       const before = p.redeemed.find((r) => r.subject === subject);
-      if (before !== undefined) return { credential: sign(s.vouches.find((v) => v.statusIndex === before.statusIndex)!) };
+      if (before !== undefined) return { credential: this.sign(s, s.vouches.find((v) => v.statusIndex === before.statusIndex)!) };
       if (p.redeemed.length >= PICKUP_MAX_SUBJECTS) throw new OfficeError(410, 'used_up');
       // One key, one person: a parent's key cannot collect the child's vouch.
       if (s.vouches.some((v) => v.subject === subject && v.rosterId !== p.rosterId)) {
@@ -445,12 +451,75 @@ export class Office {
         issuedAt: isoSeconds(now),
         validUntil: p.validUntil,
       };
-      const credential = sign(v);
+      const credential = this.sign(s, v);
       s.nextStatusIndex++; // how many places are taken, for status_list_full
       s.vouches.push(v);
       p.redeemed.push({ subject, statusIndex: v.statusIndex });
       return { credential };
     });
+  }
+
+  /**
+   * Every vouch about the key that signed the proof that is neither withdrawn
+   * nor ended, newest period first, each signed by the current node: after a
+   * new node the same vouch, place and dates, with a new signature. A key the
+   * office does not know gets an empty list, as does one with nothing live.
+   *
+   * Renewal: when the registrar has vouched a row for a later period, a key
+   * holding a vouch of that row, live or lapsed, gets that period's vouch
+   * here, issued now at a new place, with no code. A withdrawn row, or one
+   * without consent, gets nothing new.
+   */
+  collect(proof: unknown): { vouches: string[] } {
+    const s = this.store.load();
+    const now = this.now();
+    const subject = proofSubject(proof, s.did, COLLECT_NONCE, now);
+    const renewed = this.renew(s, subject, now);
+    const vouches = s.vouches
+      .filter((v) => v.subject === subject && isLive(v, now))
+      .sort((a, b) => b.validUntil.localeCompare(a.validUntil) || b.issuedAt.localeCompare(a.issuedAt) || a.statusIndex - b.statusIndex)
+      .map((v) => this.sign(s, v));
+    // A collect is a read, unless it issued a renewal.
+    if (renewed) this.store.save(s);
+    return { vouches };
+  }
+
+  /** Issue the later periods the subject's rows are vouched for that it does not hold. True if any. */
+  private renew(s: OfficeState, subject: string, now: number): boolean {
+    // Withdrawn vouches renew nothing, and do not count as held.
+    const held = s.vouches.filter((v) => v.subject === subject && v.withdrawnAt === undefined);
+    let issued = false;
+    for (const rosterId of new Set(held.map((v) => v.rosterId))) {
+      const row = s.roster.find((r) => r.id === rosterId);
+      if (row === undefined || !row.consent || row.withdrawnAt !== undefined) continue;
+      // A row's claim is fixed by its kind, and its kind once set.
+      const claim = CLAIM_FOR[row.kind];
+      const mine = held.filter((v) => v.rosterId === rosterId && v.claim === claim);
+      if (mine.length === 0) continue;
+      const first = mine.map((v) => v.validUntil).sort()[0]!;
+      const periods = new Set(mine.map((v) => v.validUntil));
+      // The registrar's vouches of the row for a later period still to end; the first for each period.
+      const later = s.pickups
+        .filter((p) => p.rosterId === rosterId && p.claim === claim && p.withdrawnAt === undefined && p.validUntil > first && at(p.validUntil) > now)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      for (const p of later) {
+        if (periods.has(p.validUntil)) continue;
+        if (s.nextStatusIndex >= STATUS_LIST_BITS) throw new OfficeError(507, 'status_list_full');
+        s.vouches.push({
+          statusIndex: unusedStatusIndex(s.vouches),
+          rosterId,
+          claim,
+          subject,
+          validFrom: p.validFrom,
+          issuedAt: isoSeconds(now),
+          validUntil: p.validUntil,
+        });
+        s.nextStatusIndex++;
+        periods.add(p.validUntil);
+        issued = true;
+      }
+    }
+    return issued;
   }
 
   // ── registrar ──────────────────────────────────────────────────────────────
@@ -660,6 +729,8 @@ export class Office {
         r.withdrawnAt = stamp;
         r.sponsorNote = sponsorNote === true;
         cancelledPickups += cancelPickups(s, r.id, now);
+        // Every vouch of the row made so far is void, for renewal too.
+        for (const p of s.pickups) if (p.rosterId === r.id) p.withdrawnAt ??= stamp;
         const statusIndexes: number[] = [];
         for (const v of s.vouches) {
           if (v.rosterId === r.id && v.withdrawnAt === undefined) {
@@ -686,6 +757,9 @@ export class Office {
       for (const v of s.vouches) if (isLive(v, now)) live.set(v.rosterId, [...(live.get(v.rosterId) ?? []), v]);
       const openFor = new Map<string, Pickup[]>();
       for (const p of s.pickups) if (isOpen(p, now)) openFor.set(p.rosterId, [...(openFor.get(p.rosterId) ?? []), p]);
+      // Each period the registrar has vouched a row for, its code used or not: with consent, the row's holders collect it.
+      const vouchedFor = new Map<string, Pickup[]>();
+      for (const p of s.pickups) if (p.withdrawnAt === undefined) vouchedFor.set(p.rosterId, [...(vouchedFor.get(p.rosterId) ?? []), p]);
       const hasLive = (id: string) => live.has(id);
       const hasOpen = (id: string) => openFor.has(id);
       const current = s.roster.filter((r) => r.withdrawnAt === undefined);
@@ -725,7 +799,7 @@ export class Office {
           : current
               .filter((r) => {
                 if (going.get(r.id) !== null) return false;
-                const ends = [...(live.get(r.id) ?? []), ...(openFor.get(r.id) ?? [])].map((x) => x.validUntil);
+                const ends = [...(live.get(r.id) ?? []), ...(r.consent ? (vouchedFor.get(r.id) ?? []) : [])].map((x) => x.validUntil);
                 return (live.get(r.id) ?? []).some((v) => v.validUntil === periodEnd) && ends.every((e) => e <= periodEnd);
               })
               .map((r) => ({ ...item(r), lapsesAt: periodEnd }));
