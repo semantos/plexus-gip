@@ -168,14 +168,45 @@ id (the tests scan them).
   and will not say, then each app's key collects its own vouch with a proof
   `{aud: body, nonce: code, iat}` (OpenID4VCI's `jwt` proof type): up to four
   keys a code, each its own status index, and one key holds one row's vouches.
+- **Finding the office.** A seat card carries only the child's key and where
+  to look; the device collects its vouches from each body's office (Todd's
+  decision, 5 November 2026). The DID document the office serves names it:
+  `service: [{id: <did>#vouch-office, type: BodyVouchOffice, serviceEndpoint:
+  <office base URL>}]`. A device resolves the body's did:web as the DID Web
+  method says (`did:web:host%3Aport:path` is `https://host:port/path/did.json`,
+  and with no path `/.well-known/did.json`) and reads the endpoint from the
+  document: `didWebDocumentUrl` and `vouchOfficeOf` in `src/bodies/didweb.ts`,
+  which build and read and never fetch. `allowHttpLocal` lets a reader use
+  http for `localhost` and `127.0.0.1`, for local work and tests only.
+- **Collecting.** `POST /collect {proof}` takes the pickup's proof with the
+  nonce `collect`, `{aud: body, nonce: "collect", iat}`, refused (400) if more
+  than 300 s from the office's clock, for another audience or with another
+  nonce. The answer is `{vouches: [...]}`: every vouch about that key that is
+  neither withdrawn nor ended, newest period first, each signed by the
+  current node, so after `rotate-node` the device gets the same vouch (place
+  and dates) under the new node's signature. An unknown key gets `{vouches:
+  []}`, the same as a key with nothing live, so the route cannot be used to
+  ask whether a key is known. No label, group or roster id is in the answer.
+- **Renewal.** When the registrar vouches a row again for a later period
+  (`/desk/vouch` with a later `periodEnd`), every key holding a live or
+  lapsed vouch of that row collects the new period's vouch the next time it
+  collects, with no new code: issued at collect time, at a new random place,
+  valid from the day the registrar vouched. This period's vouches stay live
+  beside it. A withdrawn row, or one without consent, gets nothing new. A
+  withdrawal is final for the vouches it withdraws: a row taken back renews
+  its keys only from periods vouched after, and a withdrawn key needs a code.
+  The home list does not show a row vouched for a later period as lapsing.
 - **Nodes.** `rotate-node --anchor-key <file>` makes a new node key; the
   anchor key signs its delegation, the new node signs the list, and the old
   node's delegation stays on it, so its vouches still pass. `retire-node
   <node>` takes an old node's delegation off: every vouch that node signed
-  then fails with `node_not_delegated`, and those families need a new one. The
+  then fails with `node_not_delegated`. A device that collected after the
+  rotation already holds the same vouch from the new node, so retire an old
+  node once holders have collected, or at once if its key may be lost. The
   current node cannot be retired. The list is signed again whenever the
   delegations change.
-- **Public**: `/.well-known/did.json` (the anchor as a secp256k1 Multikey) and
-  `/status/1`, signed again at each withdrawal and each change of node. A
-  pilot may sign its own entry with a local steward key; `init` warns that a
-  body must not steward itself.
+- **Public**: `/.well-known/did.json` (the anchor as a secp256k1 Multikey, and
+  the office as a service), `/status/1`, signed again at each withdrawal and
+  each change of node, `/pickup/<code>` and `POST /collect`. A pilot may sign
+  its own entry with a local steward key; `init` warns that a body must not
+  steward itself.

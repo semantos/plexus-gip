@@ -80,7 +80,7 @@ bun bodies/demo.ts   # a school, then a scout group, through the same code
 bun test             # every refusal, the known-answer file, the ported wire formats
 ```
 
-`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json` (`bun run office init`, then `serve`; `rotate-node` and `retire-node` move to a new signing node and withdraw an old one; see the doc's §6).
+`bodies/office/` is the body's own issuing service: a roster that keeps names to itself, consent, one-time pickup codes the parent scans at the office, the withdrawal list and the body's `did.json`, which names the office. A device collects its vouches there with `POST /collect`: signed again after a new node, and each later period's vouch with no new code; `didWebDocumentUrl` and `vouchOfficeOf` find the office from the body's did:web (`bun run office init`, then `serve`; `rotate-node` and `retire-node` move to a new signing node and withdraw an old one; see the doc's §6).
 
 ## Paid-attestation portal (prototype)
 
