@@ -344,6 +344,11 @@ describe('the pilot, end to end', () => {
     expect(r.json.withdrawn).toHaveLength(1);
     const miaIndexes: number[] = r.json.withdrawn[0].statusIndexes;
     expect(miaIndexes).toHaveLength(4);
+    // One child's vouches for four apps must not sit side by side on the list,
+    // or two apps comparing indexes could tell they hold the same child.
+    const sorted = [...miaIndexes].sort((a, b) => a - b);
+    expect(sorted.some((x, i) => i > 0 && x - sorted[i - 1]! > 1)).toBe(true);
+    expect(new Set(miaIndexes).size).toBe(4);
 
     const list = await o.pub('GET', '/status/1');
     expect(list.text).not.toBe(listJwt);
@@ -438,6 +443,21 @@ describe('pickups', () => {
     const v = await o.desk('POST', '/desk/vouch', { ids: [id] });
     return codeOf(v.json.pickups[0].url);
   }
+
+  test('one person\'s vouches get scattered list indexes, so apps cannot match them by place', async () => {
+    clock = NOW;
+    const code = await fresh('p-idx');
+    const indexes: number[] = [];
+    for (const app of ['a', 'b', 'c', 'd']) {
+      const r = await o.pub('POST', `/pickup/${code}`, { proof: pickupProof({ subjectSk: holder(`p-idx-${app}`), body: DID, code, at: clock }) });
+      expect(r.status).toBe(200);
+      indexes.push(Number(payloadOf(r.json.credential).credentialStatus.statusListIndex));
+    }
+    expect(new Set(indexes).size).toBe(4);
+    const sorted = [...indexes].sort((a, b) => a - b);
+    // Handed out in order, four redemptions in a row would be a run of four.
+    expect(sorted.every((x, i) => i === 0 || x === sorted[i - 1]! + 1)).toBe(false);
+  });
 
   test('an expired pickup is 410, for a look and for a redemption', async () => {
     const code = await fresh('p-1');

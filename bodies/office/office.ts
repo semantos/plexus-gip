@@ -10,7 +10,7 @@
  * Names never leave. A public answer carries the body, the claim and the
  * dates, and nothing from the roster: no label, no group, no roster id.
  */
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { PrivateKey } from '@bsv/sdk';
 import {
   type BodyClaim,
@@ -43,6 +43,21 @@ import {
 } from './state';
 
 /** How long a pickup code lasts, in seconds. */
+
+/**
+ * A random free place on the withdrawal list. Places handed out in order
+ * would put one person's vouches for different apps side by side, and two
+ * apps comparing places could tell they hold the same person; Bitstring
+ * Status List 1.0 says to choose them at random for this reason.
+ */
+function unusedStatusIndex(vouches: readonly { statusIndex: number }[]): number {
+  const taken = new Set(vouches.map((v) => v.statusIndex));
+  for (;;) {
+    const i = randomInt(0, STATUS_LIST_BITS);
+    if (!taken.has(i)) return i;
+  }
+}
+
 export const PICKUP_TTL = 7 * 86400;
 
 /** How many subjects one pickup serves: one per app a family uses. */
@@ -398,7 +413,7 @@ export class Office {
       if (row === undefined || !row.consent || row.withdrawnAt !== undefined) throw new OfficeError(410, 'cancelled');
       if (s.nextStatusIndex >= STATUS_LIST_BITS) throw new OfficeError(507, 'status_list_full');
       const v: IssuedVouch = {
-        statusIndex: s.nextStatusIndex,
+        statusIndex: unusedStatusIndex(s.vouches),
         rosterId: p.rosterId,
         claim: p.claim,
         subject,
@@ -407,7 +422,7 @@ export class Office {
         validUntil: p.validUntil,
       };
       const credential = sign(v);
-      s.nextStatusIndex++;
+      s.nextStatusIndex++; // how many places are taken, for status_list_full
       s.vouches.push(v);
       p.redeemed.push({ subject, statusIndex: v.statusIndex });
       return { credential };

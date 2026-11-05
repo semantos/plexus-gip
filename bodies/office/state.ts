@@ -97,6 +97,7 @@ export interface OfficeState {
   tokenHash: string;
   roster: RosterRow[];
   vouches: IssuedVouch[];
+  /** How many places on the withdrawal list are taken. Places are chosen at random, never in order. */
   nextStatusIndex: number;
   pickups: Pickup[];
 }
