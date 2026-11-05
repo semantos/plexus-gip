@@ -1,0 +1,59 @@
+# The vouch office for one attestor, beside its brain on the same host
+# (bodies/office/deploy/README.md).
+#
+#     systemctl enable --now vouch-office@hillside
+#
+# %i names the attestor. Its state, made by `cli.ts init`, is
+# /var/lib/vouch-office/%i/office.json: the node key, the roster with the
+# children's names, the vouches. Its port and the desk's origin are in
+# /etc/vouch-office/%i.env, which holds no secret.
+#
+# The office listens on 127.0.0.1 only. Caddy, in front of it and of the
+# brain, serves its public routes to everyone and /desk/* only to the desk.
+
+[Unit]
+Description=Vouch office for %i
+Documentation=file:///opt/plexus-gip/bodies/office/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vouch-office
+Group=vouch-office
+WorkingDirectory=/opt/plexus-gip
+# OFFICE_PORT for the command line; OFFICE_DESK_ORIGIN, which serve reads itself.
+EnvironmentFile=/etc/vouch-office/%i.env
+# --no-install: bun never fetches a package at run time; the checkout's own
+# node_modules, from `bun install --frozen-lockfile`, is all it loads.
+ExecStart=/usr/local/bin/bun --no-install run bodies/office/cli.ts serve --state /var/lib/vouch-office/%i/office.json --host 127.0.0.1 --port ${OFFICE_PORT}
+Restart=on-failure
+RestartSec=5
+
+# The state is the only thing it writes. StateDirectory makes it, owned by
+# the service's user and writable under ProtectSystem=strict.
+StateDirectory=vouch-office/%i
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+# Not MemoryDenyWriteExecute: bun's JIT writes the code it runs.
+
+[Install]
+WantedBy=multi-user.target

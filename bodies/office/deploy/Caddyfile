@@ -1,0 +1,33 @@
+# The vouch office for one attestor, behind the same Caddy as its brain
+# (bodies/office/deploy/README.md). Add this site to /etc/caddy/Caddyfile
+# beside the brain's, and replace the office's host, the desk's origin and
+# the port with those in /etc/vouch-office/<attestor>.env.
+#
+# No `log` here: a pickup URL is a secret until it is used, and an access log
+# would keep it.
+
+vouch.hillside.example.edu.au {
+	# Public: the body's DID document and withdrawal list, which apps check
+	# against, and the pickup and collect routes a family's phone and a
+	# child's device use. None of them carries a name.
+	@public path /.well-known/did.json /status/* /pickup/* /collect
+	handle @public {
+		reverse_proxy 127.0.0.1:8781
+	}
+
+	# The registrar's desk: only from the desk's origin, the brain that serves
+	# the Helm. The office checks the origin again, and wants the registrar's
+	# token from every origin. To hold it to the school's own network as well,
+	# add `remote_ip <the school's addresses>` to this matcher.
+	@desk {
+		path /desk/*
+		header Origin https://brain.hillside.example.edu.au
+	}
+	handle @desk {
+		reverse_proxy 127.0.0.1:8781
+	}
+
+	handle {
+		respond 404
+	}
+}
