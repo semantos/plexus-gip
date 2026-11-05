@@ -26,6 +26,7 @@ import {
   b64url,
   delegateSigner,
   didKeyOf,
+  didWebPath,
   isoSeconds,
   issueStatusList,
   issueVouch,
@@ -43,7 +44,6 @@ import {
   type RosterRow,
   type Store,
   didWebOrigin,
-  didWebPath,
   hashToken,
   newToken,
 } from './state';

@@ -19,6 +19,8 @@ import {
   WireError,
   b64url,
   delegateSigner,
+  didWebHost,
+  didWebPath,
   isoSeconds,
   issueRegistryEntry,
   issueStatusList,
@@ -159,19 +161,8 @@ export const newToken = (): string => b64url(new Uint8Array(randomBytes(32)));
 
 // ── did:web ──────────────────────────────────────────────────────────────────
 
-function didWebParts(did: string): string[] {
-  if (!did.startsWith('did:web:') || did.length === 'did:web:'.length) throw new WireError('bad_did', 'expected a did:web');
-  return did.slice('did:web:'.length).split(':').map((p) => decodeURIComponent(p));
-}
-
-/** Where a did:web's document lives on its host (did:web method, "Read"). */
-export function didWebPath(did: string): string {
-  const [, ...path] = didWebParts(did);
-  return path.length === 0 ? '/.well-known/did.json' : `/${path.join('/')}/did.json`;
-}
-
 /** The https origin a did:web names. */
-export const didWebOrigin = (did: string): string => `https://${didWebParts(did)[0]}`;
+export const didWebOrigin = (did: string): string => `https://${didWebHost(did)}`;
 
 function originOf(url: string): string {
   const u = URL.parse(url);

@@ -41,6 +41,7 @@ import { STATUS_LIST_BITS, decodeStatusList, encodeStatusList, statusListBit } f
 
 export { WireError, b64url, base58btc, fromB64url, fromBase58btc, fromHex, fromUtf8, hex, utf8 } from './bytes';
 export { didKeyFromPublicKey, keyIdFor, publicKeyFromDidKey } from './didkey';
+export { BODY_VOUCH_OFFICE, type DidWebOptions, didWebDocumentUrl, didWebHost, didWebPath, vouchOfficeOf } from './didweb';
 export {
   type JwtHeader,
   type JwtTyp,

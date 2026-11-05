@@ -154,12 +154,14 @@ export {
   DELEGATION_EVIDENCE_TYPE,
   EDGE_CREATION,
   PRESENTATION_MAX_SKEW,
+  BODY_VOUCH_OFFICE,
   REGISTRY_ENTRY_TYPE,
   STATUS_LIST_TYPE,
   type BodyClaim,
   type BodyKind,
   type BodyRefusal,
   type BodyVerdict,
+  type DidWebOptions,
   type Instant,
   type PresentInput,
   type RegistryEntry,
@@ -168,6 +170,9 @@ export {
   type VerifyPresentationOptions,
   type VouchInput,
   didKeyOf,
+  didWebDocumentUrl,
+  didWebHost,
+  didWebPath,
   isoSeconds,
   issueRegistryEntry,
   issueStatusList,
@@ -177,6 +182,7 @@ export {
   readRegistryEntry,
   relationshipKey,
   verifyPresentation,
+  vouchOfficeOf,
 } from './bodies';
 
 // The wire formats under it, ported from the bitpiggy wire package: did:key for
