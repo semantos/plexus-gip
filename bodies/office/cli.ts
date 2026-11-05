@@ -5,7 +5,7 @@
  *     bun bodies/office/cli.ts init --did did:web:<host> --anchor-key <file> --entry <file>
  *     bun bodies/office/cli.ts init --did did:web:<host> --anchor-key <file> \
  *         --steward-key <file> --kind school --period-ends 2026-12-31T23:59:59Z,2027-12-31T23:59:59Z
- *     bun bodies/office/cli.ts serve [--port 8080] [--host 127.0.0.1]
+ *     bun bodies/office/cli.ts serve [--port 8080] [--host 127.0.0.1] [--desk-origin <origin>[,<origin>]]
  *     bun bodies/office/cli.ts token
  *     bun bodies/office/cli.ts rotate-node --anchor-key <file>
  *     bun bodies/office/cli.ts retire-node <node>
@@ -13,6 +13,9 @@
  * Every command but keygen takes `--state <file>`, by default $OFFICE_STATE or
  * `.gip-v2/office.json`. `init` also takes `--url <origin>` when the office is
  * not at the did:web's host, and `--claims` (default member,guardian_of_member).
+ * `serve` takes `--desk-origin`, by default $OFFICE_DESK_ORIGIN: the origins a
+ * browser may reach the desk routes from, such as the brain that serves the
+ * registrar's Helm. The token is still required from them.
  *
  * The anchor key file is read once, to sign the node's delegation, and is not
  * copied into the state. Keep it offline after init, and bring it out again
@@ -27,14 +30,14 @@ import { dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 import { PrivateKey } from '@bsv/sdk';
 import type { BodyClaim, BodyKind } from '../../src';
-import { serveOffice } from './http';
+import { deskOrigin, serveOffice } from './http';
 import { Office } from './office';
 import { fileStore, initState } from './state';
 
 const HELP = `commands:
   keygen <file>         make a key file (an anchor, or a pilot's steward), mode 600
   init                  make the office: --did --anchor-key, and --entry or --steward-key
-  serve                 run it: --port (8080) --host (127.0.0.1)
+  serve                 run it: --port (8080) --host (127.0.0.1) --desk-origin (the desk's origins, comma separated)
   token                 make a new registrar token; the old one stops working
   rotate-node           make a new signing node: --anchor-key; the old one stays honoured until retired
   retire-node <node>    stop honouring an old node: every vouch it signed then fails
@@ -119,9 +122,21 @@ function serve(v: Record<string, string | undefined>, statePath: string): void {
   if (info.pilotSteward) console.error(STEWARD_WARNING);
   const port = Number(v.port ?? 8080);
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail('--port is a port number');
-  const server = serveOffice(office, { port, hostname: v.host });
+  const origins = (v['desk-origin'] ?? process.env.OFFICE_DESK_ORIGIN ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter((o) => o !== '');
+  for (const o of origins) {
+    try {
+      deskOrigin(o);
+    } catch (e) {
+      fail(`--desk-origin: ${(e as Error).message}`);
+    }
+  }
+  const server = serveOffice(office, { port, hostname: v.host, deskOrigins: origins });
   console.log(`office for ${info.did} listening on http://${server.hostname}:${server.port}`);
   console.log(`  reached at ${info.baseUrl}: put TLS in front, the registrar token is a bearer secret`);
+  console.log(origins.length === 0 ? '  desk from no other origin (--desk-origin to add one)' : `  desk from ${origins.join(', ')}`);
 }
 
 function token(statePath: string): void {
@@ -167,6 +182,7 @@ function main(): void {
       'period-ends': { type: 'string' },
       port: { type: 'string' },
       host: { type: 'string' },
+      'desk-origin': { type: 'string' },
       help: { type: 'boolean' },
     },
   });

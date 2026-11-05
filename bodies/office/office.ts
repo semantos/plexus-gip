@@ -185,6 +185,9 @@ export interface Needs {
     consented: number;
     /** Rows with a live vouch. */
     vouched: number;
+    /** Of those, members and guardians. */
+    vouchedMembers: number;
+    vouchedGuardians: number;
     /** Rows with a code out and no live vouch yet. */
     awaitingPickup: number;
     withdrawn: number;
@@ -200,6 +203,40 @@ export interface Needs {
   lapsing: (NeedsItem & { lapsesAt: string })[];
   /** Consent withdrawn, and a vouch still live. */
   consentWithdrawn: NeedsItem[];
+}
+
+/** Where the body stands, for the desk: its registry entry, its nodes and its withdrawal list. */
+export interface Standing {
+  at: string;
+  /** The registry entry, as its steward signed it. */
+  entry: {
+    did: string;
+    kind: BodyKind;
+    claims: readonly BodyClaim[];
+    periodEnds: readonly string[];
+    /** The steward's did:key. */
+    steward: string;
+    /** True when the entry was signed here with a local steward key: a pilot only. */
+    pilotSteward: boolean;
+    validFrom: string;
+    validUntil: string;
+  };
+  /** Where the DID document must be found for the did:web to resolve. */
+  didDocument: string;
+  /** Where the office is reached. */
+  office: string;
+  anchor: string;
+  /** The node that signs, compressed hex. */
+  node: string;
+  /** Every node the withdrawal list honours, the signing node first. */
+  nodes: string[];
+  withdrawals: {
+    url: string;
+    /** When the list now published was signed: at init, a withdrawal or a change of node. */
+    signedAt: string;
+    /** How many places it marks withdrawn. */
+    withdrawn: number;
+  };
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -576,6 +613,38 @@ export class Office {
     });
   }
 
+  /** Where the body stands: what the desk shows beside its home list. */
+  standing(): Standing {
+    return this.read((s, now) => {
+      const e = this.entry(s);
+      const list = verifyJwtByKid(s.statusList);
+      if (list === null || typeof list.payload.validFrom !== 'string') throw new OfficeError(500, 'bad_state', 'the withdrawal list does not verify');
+      return {
+        at: isoSeconds(now),
+        entry: {
+          did: e.did,
+          kind: e.kind,
+          claims: e.claims,
+          periodEnds: e.periodEnds,
+          steward: e.steward,
+          pilotSteward: s.pilotSteward,
+          validFrom: e.validFrom,
+          validUntil: e.validUntil,
+        },
+        didDocument: `${didWebOrigin(s.did)}${didWebPath(s.did)}`,
+        office: s.baseUrl,
+        anchor: s.anchor,
+        node: this.node(s).toPublicKey().toString(),
+        nodes: this.honoured(s),
+        withdrawals: {
+          url: e.statusList,
+          signedAt: list.payload.validFrom,
+          withdrawn: s.vouches.filter((v) => v.withdrawnAt !== undefined).length,
+        },
+      };
+    });
+  }
+
   rows(): RosterRow[] {
     return this.read((s) => s.roster.map(tidy));
   }
@@ -814,6 +883,8 @@ export class Office {
           guardians: s.roster.filter((r) => r.kind === 'guardian').length,
           consented: s.roster.filter((r) => r.consent).length,
           vouched: current.filter((r) => hasLive(r.id)).length,
+          vouchedMembers: current.filter((r) => r.kind === 'member' && hasLive(r.id)).length,
+          vouchedGuardians: current.filter((r) => r.kind === 'guardian' && hasLive(r.id)).length,
           awaitingPickup: current.filter((r) => hasOpen(r.id) && !hasLive(r.id)).length,
           withdrawn: s.roster.filter((r) => r.withdrawnAt !== undefined).length,
           liveVouches: [...live.values()].reduce((n, l) => n + l.length, 0),

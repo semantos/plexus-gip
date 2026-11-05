@@ -17,9 +17,16 @@
  *     POST /desk/vouch {ids, periodEnd?}           pickup URLs, for QR codes
  *     POST /desk/withdraw {ids, sponsorNote?}
  *     GET  /desk/needs               the home list
+ *     GET  /desk/standing            the registry entry, the nodes, the withdrawal list
+ *
+ * The desk is a page on another origin (the Helm, served by the body's
+ * brain), so the office answers a browser from the origins it is given
+ * (`deskOrigins`) and from no other. That is CORS, not a lock: every desk
+ * route still wants the token, whoever asks.
  *
  * The server speaks plain HTTP on localhost by default. Put TLS in front of
  * it: the token is a bearer secret, and so is a pickup code until it is used.
+ * `deploy/` has a systemd unit and a Caddy site for it, beside a brain.
  */
 import { Office, OfficeError } from './office';
 
@@ -66,14 +73,35 @@ const DESK = new Map<string, string[]>([
   ['vouch', ['POST']],
   ['withdraw', ['POST']],
   ['needs', ['GET']],
+  ['standing', ['GET']],
 ]);
 
-async function desk(office: Office, req: Request, name: string): Promise<Response> {
+/** What a desk route answers a GET with. */
+const DESK_READS: Record<string, (office: Office) => unknown> = {
+  roster: (office) => ({ rows: office.rows() }),
+  needs: (office) => office.needs(),
+  standing: (office) => office.standing(),
+};
+
+async function desk(office: Office, req: Request, name: string, allowed: (origin: string | null) => boolean): Promise<Response> {
+  if (req.method === 'OPTIONS') {
+    // A browser asks before it sends the token. Only the desk's origins are told yes.
+    const origin = req.headers.get('origin');
+    if (!allowed(origin)) throw new OfficeError(403, 'origin_not_allowed');
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'access-control-allow-methods': DESK.get(name)!.join(', '),
+        'access-control-allow-headers': 'authorization, content-type',
+        'access-control-max-age': '600',
+      },
+    });
+  }
   only(DESK.get(name)!, req);
   const token = bearer(req);
   if (token === null) throw new OfficeError(401, 'no_token');
   if (token === '' || !office.checkToken(token)) throw new OfficeError(401, 'bad_token');
-  if (req.method === 'GET') return json(name === 'needs' ? office.needs() : { rows: office.rows() });
+  if (req.method === 'GET') return json(DESK_READS[name]!(office));
   const b = await bodyOf(req);
   switch (name) {
     case 'roster':
@@ -87,9 +115,9 @@ async function desk(office: Office, req: Request, name: string): Promise<Respons
   }
 }
 
-async function route(office: Office, req: Request, path: string): Promise<Response> {
+async function route(office: Office, req: Request, path: string, allowed: (origin: string | null) => boolean): Promise<Response> {
   const deskName = /^\/desk\/([a-z]+)$/.exec(path)?.[1];
-  if (deskName !== undefined && DESK.has(deskName)) return desk(office, req, deskName);
+  if (deskName !== undefined && DESK.has(deskName)) return desk(office, req, deskName, allowed);
 
   if (path.endsWith('/did.json') && path === office.didDocumentPath()) {
     only(['GET'], req);
@@ -132,23 +160,50 @@ function failure(e: unknown): Response {
   return json({ error: e.code, ...(e.detail !== undefined && { detail: e.detail }) }, e.status, headers);
 }
 
+/** An origin, as a browser sends it: a scheme of http or https, a host and maybe a port, and nothing more. */
+export function deskOrigin(origin: string): string {
+  const u = URL.parse(origin);
+  if (u === null || (u.protocol !== 'https:' && u.protocol !== 'http:') || u.origin !== origin) {
+    throw new OfficeError(400, 'bad_desk_origin', `a desk origin is a scheme and host, such as https://brain.example.org, not ${origin}`);
+  }
+  return origin;
+}
+
+export interface OfficeHandlerOptions {
+  /**
+   * The origins the registrar's desk is served from, such as the body's
+   * brain, which serves the Helm. A browser on one of them may call the desk
+   * routes; it still needs the token. None by default.
+   */
+  deskOrigins?: readonly string[];
+}
+
 /** A fetch handler for the office: Bun.serve, a Worker, or a test calling it directly. */
-export function officeHandler(office: Office): Handler {
+export function officeHandler(office: Office, o: OfficeHandlerOptions = {}): Handler {
+  const origins = new Set((o.deskOrigins ?? []).map(deskOrigin));
+  const allowed = (origin: string | null) => origin !== null && origins.has(origin);
   return async (req) => {
     const path = new URL(req.url).pathname;
     let res: Response;
     try {
-      res = await route(office, req, path);
+      res = await route(office, req, path, allowed);
     } catch (e) {
       res = failure(e);
     }
-    // Apps fetch the public half from their own pages; the desk is not for other origins.
-    if (!path.startsWith('/desk/')) res.headers.set('access-control-allow-origin', '*');
+    if (!path.startsWith('/desk/')) {
+      // Apps fetch the public half from their own pages.
+      res.headers.set('access-control-allow-origin', '*');
+    } else if (origins.size > 0) {
+      // The desk is for its own origins only, and a cache must not hand one origin's answer to another.
+      res.headers.set('vary', 'Origin');
+      const origin = req.headers.get('origin');
+      if (allowed(origin)) res.headers.set('access-control-allow-origin', origin!);
+    }
     return res;
   };
 }
 
-export interface ServeOptions {
+export interface ServeOptions extends OfficeHandlerOptions {
   port: number;
   /** Defaults to 127.0.0.1: put TLS in front. */
   hostname?: string;
@@ -159,6 +214,6 @@ export function serveOffice(office: Office, o: ServeOptions) {
     port: o.port,
     hostname: o.hostname ?? '127.0.0.1',
     maxRequestBodySize: 1 << 20,
-    fetch: officeHandler(office),
+    fetch: officeHandler(office, o),
   });
 }
