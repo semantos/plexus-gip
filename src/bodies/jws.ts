@@ -20,7 +20,12 @@ import { didKeyFromPublicKey, keyIdFor, publicKeyFromDidKey } from './didkey';
 
 export const VC_CONTEXT = 'https://www.w3.org/ns/credentials/v2';
 
-export type JwtTyp = 'vc+jwt' | 'vp+jwt';
+/**
+ * `openid4vci-proof+jwt` is a holder's proof of its key when it collects a
+ * credential (OpenID4VCI's `jwt` proof type): {aud: the issuer, nonce, iat}.
+ * It has its own type, so a presentation cannot be passed off as one.
+ */
+export type JwtTyp = 'vc+jwt' | 'vp+jwt' | 'openid4vci-proof+jwt';
 
 export interface JwtHeader {
   alg: 'ES256K';
