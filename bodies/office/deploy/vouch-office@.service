@@ -5,11 +5,13 @@
 #
 # %i names the attestor. Its state, made by `cli.ts init`, is
 # /var/lib/vouch-office/%i/office.json: the node key, the roster with the
-# children's names, the vouches. Its port and the desk's origin are in
+# children's names, the vouches, the registrars. Its port is in
 # /etc/vouch-office/%i.env, which holds no secret.
 #
-# The office listens on 127.0.0.1 only. Caddy, in front of it and of the
-# brain, serves its public routes to everyone and /desk/* only to the desk.
+# The office listens on 127.0.0.1 only, and takes the desk only through the
+# brain (--desk-auth brain). Caddy, in front of it and of the brain, serves
+# its public routes to everyone, and /api/v1/vouch/desk/* on the brain's host
+# to a caller the brain names (brain-desk.caddy).
 
 [Unit]
 Description=Vouch office for %i
@@ -23,10 +25,12 @@ User=vouch-office
 Group=vouch-office
 WorkingDirectory=/opt/plexus-gip
 # OFFICE_PORT for the command line; OFFICE_DESK_ORIGIN, which serve reads itself.
+# --desk-auth brain is on the command line, not in the env file, so a deploy
+# never runs the development token.
 EnvironmentFile=/etc/vouch-office/%i.env
 # --no-install: bun never fetches a package at run time; the checkout's own
 # node_modules, from `bun install --frozen-lockfile`, is all it loads.
-ExecStart=/usr/local/bin/bun --no-install run bodies/office/cli.ts serve --state /var/lib/vouch-office/%i/office.json --host 127.0.0.1 --port ${OFFICE_PORT}
+ExecStart=/usr/local/bin/bun --no-install run bodies/office/cli.ts serve --desk-auth brain --state /var/lib/vouch-office/%i/office.json --host 127.0.0.1 --port ${OFFICE_PORT}
 Restart=on-failure
 RestartSec=5
 

@@ -1,16 +1,20 @@
 /**
  * The office's deploy files (`bodies/office/deploy/`), beside a brain on one
- * host: the systemd unit starts the office as written, on localhost, and the
- * Caddy site serves the public routes to everyone and the desk only to the
- * desk's origin.
+ * host: the systemd unit starts the office as written, on localhost, behind
+ * the brain; the office's own site serves the public routes to everyone and
+ * no desk; and the desk is on the brain's host, passed to the office only
+ * after the brain names the caller. With `caddy` on PATH, both are validated
+ * and run: Caddy in front of the office and of a stand-in for the brain's
+ * /api/v1/auth/check (not a real brain), to show what reaches the office.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PrivateKey } from '@bsv/sdk';
-import { fileStore, initState } from '../bodies/office';
+import { Office, fileStore, initState, serveOffice } from '../bodies/office';
 
 const ROOT = join(import.meta.dir, '..');
 const DEPLOY = join(ROOT, 'bodies/office/deploy');
@@ -18,6 +22,7 @@ const read = (name: string) => readFileSync(join(DEPLOY, name), 'utf8');
 
 const unit = read('vouch-office@.service');
 const site = read('Caddyfile');
+const deskBlock = read('brain-desk.caddy');
 /** The example env file, as systemd reads it: KEY=value lines. */
 const env = Object.fromEntries(
   read('office.env.example')
@@ -31,10 +36,10 @@ const dir = mkdtempSync(join(tmpdir(), 'gip-office-deploy-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('the systemd unit', () => {
-  test('runs serve on localhost, its state in its own state directory, its settings from an env file', () => {
+  test('runs serve on localhost behind the brain, its state in its own state directory, its settings from an env file', () => {
     const [exec] = directive('ExecStart');
     expect(exec).toBe(
-      '/usr/local/bin/bun --no-install run bodies/office/cli.ts serve --state /var/lib/vouch-office/%i/office.json --host 127.0.0.1 --port ${OFFICE_PORT}',
+      '/usr/local/bin/bun --no-install run bodies/office/cli.ts serve --desk-auth brain --state /var/lib/vouch-office/%i/office.json --host 127.0.0.1 --port ${OFFICE_PORT}',
     );
     expect(directive('WorkingDirectory')).toEqual(['/opt/plexus-gip']);
     expect(directive('StateDirectory')).toEqual(['vouch-office/%i']);
@@ -45,14 +50,16 @@ describe('the systemd unit', () => {
     expect(directive('NoNewPrivileges')).toEqual(['true']);
   });
 
-  test('its env file names a port and the desk\'s origin, and no secret', () => {
+  test('its env file names a port, no other origin for the desk, and no secret; the desk auth is not in it', () => {
     expect(Object.keys(env).sort()).toEqual(['OFFICE_DESK_ORIGIN', 'OFFICE_PORT']);
     expect(Number.isInteger(Number(env.OFFICE_PORT))).toBe(true);
-    expect(new URL(env.OFFICE_DESK_ORIGIN!).origin).toBe(env.OFFICE_DESK_ORIGIN!);
+    // The Helm the brain serves is on the brain's host: no other origin.
+    expect(env.OFFICE_DESK_ORIGIN).toBe('');
     expect(unit).not.toMatch(/^Environment=/m);
+    expect(unit).not.toContain('OFFICE_DESK_AUTH');
   });
 
-  test('its command line starts the office, which answers the desk\'s origin', async () => {
+  test('its command line starts the office behind the brain: the desk wants the brain\'s caller, not a token', async () => {
     const key = (label: string) => PrivateKey.fromString(createHash('sha256').update(`gip-v2-deploy-test/${label}`).digest('hex'), 16);
     const year = new Date().getUTCFullYear() + 1;
     const { state } = initState({
@@ -81,11 +88,11 @@ describe('the systemd unit', () => {
         if (done) break;
         out += new TextDecoder().decode(value);
       }
-      expect(out).toContain(`desk from ${env.OFFICE_DESK_ORIGIN}`);
+      expect(out).toContain('desk auth brain');
+      expect(out).toContain('desk from no other origin');
       const base = /listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(out)![1]!;
-      const pre = await fetch(`${base}/desk/standing`, { method: 'OPTIONS', headers: { origin: env.OFFICE_DESK_ORIGIN! } });
-      expect(pre.status).toBe(204);
-      expect(pre.headers.get('access-control-allow-origin')).toBe(env.OFFICE_DESK_ORIGIN!);
+      expect((await fetch(`${base}/desk/standing`)).status).toBe(401);
+      expect((await fetch(`${base}/desk/standing`, { headers: { 'x-semantos-standing': 'operator' } })).status).toBe(200);
       expect((await fetch(`${base}/.well-known/did.json`)).status).toBe(200);
     } finally {
       p.kill();
@@ -93,7 +100,7 @@ describe('the systemd unit', () => {
   });
 });
 
-describe('the Caddy site', () => {
+describe('the office\'s own site', () => {
   /** The body of a named block: `@name {` or `handle @name {`, to its closing brace. */
   const block = (opening: string): string => {
     const at = site.indexOf(`${opening} {`);
@@ -108,17 +115,184 @@ describe('the Caddy site', () => {
     expect(block('handle @public')).toContain(upstream);
   });
 
-  test('serves the desk only to the desk\'s origin', () => {
-    const desk = block('@desk');
-    expect(desk).toContain('path /desk/*');
-    expect(desk).toContain(`header Origin ${env.OFFICE_DESK_ORIGIN}`);
-    expect(block('handle @desk')).toContain(upstream);
+  test('passes no caller to the office, whatever a client sends', () => {
+    const pub = block('handle @public');
+    expect(pub).toContain('header_up -X-Semantos-Standing');
+    expect(pub).toContain('header_up -X-Semantos-Cert-Id');
   });
 
-  test('answers 404 for anything else, and keeps no access log', () => {
+  test('has no desk, answers 404 for anything else, and keeps no access log', () => {
+    expect(site.split('\n').filter((l) => !l.trim().startsWith('#'))).not.toContainEqual(expect.stringContaining('/desk'));
     expect(site).toMatch(/\thandle \{\n\t\trespond 404\n\t\}/);
     expect(site.split('\n').filter((l) => /^\s*log\b/.test(l))).toEqual([]);
-    // Two proxies to the office and no more: nothing else reaches it.
-    expect(site.split('\n').filter((l) => l.includes('reverse_proxy'))).toHaveLength(2);
+    expect(site.split('\n').filter((l) => l.includes('reverse_proxy'))).toHaveLength(1);
   });
+});
+
+describe('the desk on the brain\'s host', () => {
+  /** The directives inside `route { }`, in the order Caddy runs them. */
+  const steps = deskBlock
+    .slice(deskBlock.indexOf('route {') + 'route {'.length)
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !l.startsWith('#') && l !== '}' && !l.startsWith('uri /') && !l.startsWith('copy_headers'));
+
+  test('is /api/v1/vouch/desk/*, and nothing else of the brain\'s', () => {
+    expect(deskBlock).toMatch(/^handle \/api\/v1\/vouch\/desk\/\* \{$/m);
+    expect(deskBlock.split('\n').filter((l) => /^\S/.test(l) && !l.startsWith('#'))).toEqual(['handle /api/v1/vouch/desk/* {', '}']);
+  });
+
+  test('drops the client\'s caller, asks the brain, drops the brain\'s credentials, then passes /desk/* to the office', () => {
+    expect(steps).toEqual([
+      'request_header -X-Semantos-Standing',
+      'request_header -X-Semantos-Cert-Id',
+      '@asked not method OPTIONS',
+      'forward_auth @asked 127.0.0.1:8082 {',
+      'request_header -Authorization',
+      'request_header -Cookie',
+      'uri strip_prefix /api/v1/vouch',
+      `reverse_proxy 127.0.0.1:${env.OFFICE_PORT}`,
+    ]);
+  });
+
+  test('asks the brain\'s /api/v1/auth/check, and copies exactly the caller it names', () => {
+    expect(deskBlock).toContain('\t\t\turi /api/v1/auth/check\n');
+    expect(deskBlock).toContain('\t\t\tcopy_headers X-Semantos-Standing X-Semantos-Cert-Id\n');
+  });
+});
+
+/** caddy, if this machine has it. */
+const caddy = Bun.which('caddy');
+const freePort = async (): Promise<number> => {
+  const s = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response() });
+  const port = s.port!;
+  s.stop(true);
+  return port;
+};
+
+/** One raw request, so a path is sent as written. */
+const raw = (port: number, lines: string): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const c = connect(port, '127.0.0.1', () => c.write(`${lines}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`));
+    let d = '';
+    c.on('data', (b) => (d += b));
+    c.on('end', () => resolve(d));
+    c.on('error', reject);
+  });
+
+describe.skipIf(caddy === null)('Caddy in front (skipped without caddy on PATH)', () => {
+  const RUTH = '0123456789abcdef0123456789abcdef';
+  const OTHER = 'fedcba9876543210fedcba9876543210';
+
+  test('caddy validate takes the office\'s site, and the brain\'s with the desk in it', () => {
+    const file = join(dir, 'validate.Caddyfile');
+    writeFileSync(file, `${site}\nbrain.hillside.example.edu.au {\n${deskBlock}\n\thandle {\n\t\treverse_proxy 127.0.0.1:8082\n\t}\n}\n`);
+    const r = Bun.spawnSync([caddy!, 'validate', '--config', file, '--adapter', 'caddyfile'], { env: { ...process.env, HOME: dir, XDG_DATA_HOME: dir, XDG_CONFIG_HOME: dir } });
+    expect(r.stdout.toString() + r.stderr.toString()).toContain('Valid configuration');
+    expect(r.exitCode).toBe(0);
+  });
+
+  test('only the caller the brain names reaches the office, without the brain\'s credentials', async () => {
+    // A stand-in for the brain, answering as runtime/semantos-brain's /api/v1/auth/check does for three bearers,
+    // and everything else its own. It is not a brain.
+    const asked: Headers[] = [];
+    const brain = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+        if (path !== '/api/v1/auth/check') return new Response(`brain ${path}`);
+        asked.push(req.headers);
+        const callers: Record<string, Record<string, string>> = {
+          'Bearer ruth': { 'x-semantos-standing': 'member', 'x-semantos-cert-id': RUTH },
+          'Bearer stranger': { 'x-semantos-standing': 'member', 'x-semantos-cert-id': OTHER },
+          // The brain sends the cert id even when empty: Caddy 2.6 would pass on its placeholder for one it lacks.
+          'Bearer op': { 'x-semantos-standing': 'operator', 'x-semantos-cert-id': '' },
+        };
+        const who = callers[req.headers.get('authorization') ?? ''];
+        return who === undefined ? Response.json({ error: 'unauthorised' }, { status: 401 }) : new Response(null, { status: 204, headers: who });
+      },
+    });
+    const { state } = initState({
+      did: 'did:web:hillside.example.edu.au',
+      anchorSk: PrivateKey.fromString(createHash('sha256').update('gip-v2-deploy-test/caddy-anchor').digest('hex'), 16),
+      stewardSk: PrivateKey.fromString(createHash('sha256').update('gip-v2-deploy-test/caddy-steward').digest('hex'), 16),
+      kind: 'school',
+      claims: ['member', 'guardian_of_member'],
+      periodEnds: [`${new Date().getUTCFullYear() + 1}-12-31T23:59:59Z`],
+      now: Math.floor(Date.now() / 1000),
+    });
+    const statePath = join(dir, 'caddy-office.json');
+    fileStore(statePath).save(state);
+    const office = new Office(fileStore(statePath));
+    office.addRegistrar(RUTH);
+    const served = serveOffice(office, { port: 0, hostname: '127.0.0.1', deskAuth: 'brain' });
+    const [brainSite, officeSite] = [await freePort(), await freePort()];
+    const config = join(dir, 'run.Caddyfile');
+    const swap = (text: string) => text.replaceAll('127.0.0.1:8082', `127.0.0.1:${brain.port}`).replaceAll(`127.0.0.1:${env.OFFICE_PORT}`, `127.0.0.1:${served.port}`);
+    writeFileSync(
+      config,
+      `{\n\tadmin off\n\tauto_https off\n}\n${swap(site).replace('vouch.hillside.example.edu.au {', `http://127.0.0.1:${officeSite} {`)}\n` +
+        `http://127.0.0.1:${brainSite} {\n${swap(deskBlock)}\n\thandle {\n\t\treverse_proxy 127.0.0.1:${brain.port}\n\t}\n}\n`,
+    );
+    const p = Bun.spawn([caddy!, 'run', '--config', config, '--adapter', 'caddyfile'], {
+      env: { ...process.env, HOME: dir, XDG_DATA_HOME: dir, XDG_CONFIG_HOME: dir },
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    try {
+      const desk = `http://127.0.0.1:${brainSite}/api/v1/vouch/desk`;
+      for (let i = 0; i < 200; i++) {
+        if (await fetch(`http://127.0.0.1:${brainSite}/`).then(() => true, () => false)) break;
+        await Bun.sleep(25);
+      }
+      const spoof = { 'x-semantos-standing': 'operator', 'x-semantos-cert-id': OTHER };
+
+      // A registrar's bearer, with a forged caller beside it: the office sees the brain's answer.
+      const ruth = await fetch(`${desk}/whoami`, { headers: { authorization: 'Bearer ruth', ...spoof } });
+      expect(await ruth.json()).toEqual({ mode: 'brain', standing: 'member', certId: RUTH, registrar: true });
+      // The brain was asked without the forged caller.
+      expect(asked.at(-1)!.get('x-semantos-standing')).toBeNull();
+      expect(asked.at(-1)!.get('x-semantos-cert-id')).toBeNull();
+
+      // No bearer, or one the brain does not know: the brain's 401, and the office never asked.
+      for (const headers of [spoof, { authorization: 'Bearer nobody', ...spoof }]) {
+        const r = await fetch(`${desk}/needs`, { headers });
+        expect(r.status).toBe(401);
+        expect((await r.json()).error).toBe('unauthorised');
+      }
+
+      // Someone the brain knows and the office does not list.
+      const stranger = await fetch(`${desk}/needs`, { headers: { authorization: 'Bearer stranger' } });
+      expect([stranger.status, (await stranger.json()).error]).toEqual([403, 'not_a_registrar']);
+
+      // The operator, with a cookie as a browser would send one: the office would refuse either credential.
+      const op = await fetch(`${desk}/needs`, { headers: { authorization: 'Bearer op', cookie: '__semantos_session=abc' } });
+      expect(op.status).toBe(200);
+      const roster = await fetch(`${desk}/roster`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer ruth', 'content-type': 'application/json' },
+        body: JSON.stringify({ rows: [{ id: 'HP-0042', kind: 'member', label: 'Mia Ellis' }] }),
+      });
+      expect(roster.status).toBe(200);
+      expect(office.deskLog().at(-1)!.by).toEqual({ standing: 'member', certId: RUTH });
+
+      // The rest of the brain's host is the brain's.
+      expect(await (await fetch(`http://127.0.0.1:${brainSite}/api/v1/info`)).text()).toBe('brain /api/v1/info');
+
+      // The office's own site has no desk, even by a path that climbs out of a public one.
+      const site = `http://127.0.0.1:${officeSite}`;
+      expect((await fetch(`${site}/desk/needs`, { headers: spoof })).status).toBe(404);
+      for (const path of ['/pickup/../desk/needs', '/pickup/%2e%2e/desk/needs', '/status/..%2fdesk/needs']) {
+        const answer = await raw(officeSite, `GET ${path} HTTP/1.1\r\nX-Semantos-Standing: operator`);
+        expect(answer).not.toMatch(/^HTTP\/1\.1 200/);
+      }
+      expect((await fetch(`${site}/.well-known/did.json`)).status).toBe(200);
+    } finally {
+      p.kill();
+      await p.exited;
+      served.stop(true);
+      brain.stop(true);
+    }
+  }, 30_000);
 });
