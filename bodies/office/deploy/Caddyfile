@@ -1,9 +1,12 @@
 # The vouch office's public site for one attestor, behind the same Caddy as
-# its brain (bodies/office/deploy/README.md). Add this site to
-# /etc/caddy/Caddyfile beside the brain's, and replace the office's host and
-# port with those in /etc/vouch-office/<attestor>.env. The registrar's desk is
-# not here: it is on the brain's own host, behind the brain's login
-# (brain-desk.caddy).
+# its brain (bodies/office/deploy/README.md). The brain's Caddy template writes
+# this site when the brain's manifest has [vouch_office] (or install.sh has
+# BRAIN_VOUCH_OFFICE_PORT and _HOST): use that. This copy is for a brain whose
+# Caddy config nothing writes. Add it beside the brain's site, and replace the
+# office's host and port with those in /etc/vouch-office/<attestor>.env.
+# test/office_deploy.test.ts holds it, line for line, to the template's. The
+# registrar's desk is not here: it is on the brain's own host, behind the
+# brain's login (brain-desk.caddy).
 #
 # No `log` here: a pickup URL is a secret until it is used, and an access log
 # would keep it.

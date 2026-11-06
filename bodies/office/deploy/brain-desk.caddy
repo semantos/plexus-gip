@@ -1,8 +1,11 @@
 # The registrar's desk, on the brain's own host, behind the brain's login
-# (bodies/office/deploy/README.md). Paste this handle block into the brain's
-# site block (the one its provisioning wrote, /etc/caddy/conf.d/<brain
-# domain>.conf), beside its `handle /api/v1/*`, and replace the brain's port
-# (8082) and the office's (8781) with this host's.
+# (bodies/office/deploy/README.md). The brain's Caddy template writes this
+# block when the brain's manifest has [vouch_office] (or install.sh has
+# BRAIN_VOUCH_OFFICE_PORT and _HOST): use that. This copy is for a brain whose
+# site block nothing writes. Put it in that site block, beside its
+# `handle /api/v1/*`, and replace the brain's port (8082) and the office's
+# (8781) with this host's. test/office_deploy.test.ts holds it, line for line,
+# to the template's.
 #
 # The desk in the Helm calls /api/v1/vouch/desk/* with the brain's own client,
 # which carries the Helm's bearer for this brain. Caddy asks the brain who that

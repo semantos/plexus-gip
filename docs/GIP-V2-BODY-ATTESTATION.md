@@ -259,7 +259,10 @@ id (the tests scan them).
   `Caddyfile` site serves `/.well-known/did.json`, `/status/*`, `/pickup/*`
   and `/collect` to everyone with no caller passed on, no desk, 404 for the
   rest, and keeps no access log, since a pickup URL is a secret until it is
-  used; `brain-desk.caddy` is the desk's block for the brain's own site. Its
+  used; `brain-desk.caddy` is the desk's block for the brain's own site. The
+  brain's own Caddy template (semantos-core `caddy_template.zig`) writes both
+  when the brain's manifest has `[vouch_office]`; these two are the same by
+  hand, and a test holds them to the template's. Its
   README covers init with the anchor key kept offline, a DID document
   published at the did's host when the office is elsewhere, and backups of
   the state file, encrypted and in Australia.

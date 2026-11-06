@@ -6,10 +6,17 @@
  * after the brain names the caller. With `caddy` on PATH, both are validated
  * and run: Caddy in front of the office and of a stand-in for the brain's
  * /api/v1/auth/check (not a real brain), to show what reaches the office.
+ *
+ * The brain's own Caddy template (semantos-core caddy_template.zig) writes the
+ * desk and the office's site; `brain-desk.caddy` and `Caddyfile` are the same
+ * by hand, for a brain whose site block nothing writes. With a semantos-core
+ * checkout (SEMANTOS_CORE_DIR, or semantos-core beside this repository), they
+ * are held line for line to the template's fixtures, and the template's whole
+ * rendered block is run in front of the office as the hand copies are.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,6 +41,19 @@ const directive = (name: string): string[] => [...unit.matchAll(new RegExp(`^${n
 
 const dir = mkdtempSync(join(tmpdir(), 'gip-office-deploy-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+/** The brain's Caddy template's fixtures, in a semantos-core checkout, or null without one. */
+const TEMPLATE = (() => {
+  const core = process.env.SEMANTOS_CORE_DIR ?? join(ROOT, '..', 'semantos-core');
+  const vectors = join(core, 'runtime/semantos-brain/tests/vectors/caddy-blocks');
+  if (!existsSync(join(vectors, 'with-vouch-office.conf.expected'))) {
+    if (process.env.SEMANTOS_CORE_DIR !== undefined) throw new Error(`SEMANTOS_CORE_DIR has no brain Caddy template fixtures at ${vectors}`);
+    return null;
+  }
+  const fixture = (name: string) => readFileSync(join(vectors, name), 'utf8');
+  return { desk: fixture('vouch-desk.caddy.expected'), site: fixture('vouch-office-site.caddy.expected'), block: fixture('with-vouch-office.conf.expected') };
+})();
+const NO_TEMPLATE = 'no semantos-core checkout: set SEMANTOS_CORE_DIR, or put semantos-core beside this repository';
 
 describe('the systemd unit', () => {
   test('runs serve on localhost behind the brain, its state in its own state directory, its settings from an env file', () => {
@@ -161,6 +181,26 @@ describe('the desk on the brain\'s host', () => {
   });
 });
 
+/** A Caddyfile's directives, one a line, without comments, blank lines or indentation. */
+const directives = (text: string): string[] =>
+  text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !l.startsWith('#'));
+
+describe.skipIf(TEMPLATE === null)(`the brain's template writes the same (skipped with ${NO_TEMPLATE})`, () => {
+  test('brain-desk.caddy is the desk the template writes into a brain\'s site, line for line', () => {
+    expect(directives(deskBlock)).toEqual(directives(TEMPLATE!.desk));
+  });
+
+  test('Caddyfile is the office\'s site the template writes, line for line', () => {
+    expect(directives(site)).toEqual(directives(TEMPLATE!.site));
+  });
+});
+
+/** Where one live run's sites and services are on this machine, and where the brain's site logs. */
+type Ports = { brainSite: number; officeSite: number; brain: number; office: number; log: string };
+
 /** caddy, if this machine has it. */
 const caddy = Bun.which('caddy');
 const freePort = async (): Promise<number> => {
@@ -192,7 +232,8 @@ describe.skipIf(caddy === null)('Caddy in front (skipped without caddy on PATH)'
     expect(r.exitCode).toBe(0);
   });
 
-  test('only the caller the brain names reaches the office, without the brain\'s credentials', async () => {
+  /** Caddy, on `config`'s sites, in front of a stand-in brain and the office: what reaches the office. */
+  const deskBehindCaddy = async (name: string, config: (p: Ports) => string) => {
     // A stand-in for the brain, answering as runtime/semantos-brain's /api/v1/auth/check does for three bearers,
     // and everything else its own. It is not a brain.
     const asked: Headers[] = [];
@@ -222,20 +263,19 @@ describe.skipIf(caddy === null)('Caddy in front (skipped without caddy on PATH)'
       periodEnds: [`${new Date().getUTCFullYear() + 1}-12-31T23:59:59Z`],
       now: Math.floor(Date.now() / 1000),
     });
-    const statePath = join(dir, 'caddy-office.json');
+    const statePath = join(dir, `caddy-office-${name}.json`);
     fileStore(statePath).save(state);
     const office = new Office(fileStore(statePath));
     office.addRegistrar(RUTH);
     const served = serveOffice(office, { port: 0, hostname: '127.0.0.1', deskAuth: 'brain' });
     const [brainSite, officeSite] = [await freePort(), await freePort()];
-    const config = join(dir, 'run.Caddyfile');
-    const swap = (text: string) => text.replaceAll('127.0.0.1:8082', `127.0.0.1:${brain.port}`).replaceAll(`127.0.0.1:${env.OFFICE_PORT}`, `127.0.0.1:${served.port}`);
-    writeFileSync(
-      config,
-      `{\n\tadmin off\n\tauto_https off\n}\n${swap(site).replace('vouch.hillside.example.edu.au {', `http://127.0.0.1:${officeSite} {`)}\n` +
-        `http://127.0.0.1:${brainSite} {\n${swap(deskBlock)}\n\thandle {\n\t\treverse_proxy 127.0.0.1:${brain.port}\n\t}\n}\n`,
-    );
-    const p = Bun.spawn([caddy!, 'run', '--config', config, '--adapter', 'caddyfile'], {
+    const log = join(dir, `caddy-${name}.access.log`);
+    const sites = config({ brainSite, officeSite, brain: brain.port!, office: served.port!, log });
+    // Every host and port of the deploy is this machine's now.
+    for (const left of ['hillside', ':8082', `:${env.OFFICE_PORT}`, 'on_demand']) expect(sites).not.toContain(left);
+    const configFile = join(dir, `run-${name}.Caddyfile`);
+    writeFileSync(configFile, `{\n\tadmin off\n\tauto_https off\n}\n${sites}`);
+    const p = Bun.spawn([caddy!, 'run', '--config', configFile, '--adapter', 'caddyfile'], {
       env: { ...process.env, HOME: dir, XDG_DATA_HOME: dir, XDG_CONFIG_HOME: dir },
       stdout: 'ignore',
       stderr: 'ignore',
@@ -294,5 +334,34 @@ describe.skipIf(caddy === null)('Caddy in front (skipped without caddy on PATH)'
       served.stop(true);
       brain.stop(true);
     }
-  }, 30_000);
+    // Where the brain's site keeps an access log, the desk's requests are in it and the brain's credentials are not.
+    if (sites.includes(log)) {
+      const kept = readFileSync(log, 'utf8');
+      expect(kept).toContain('/api/v1/vouch/desk/whoami');
+      expect(kept).not.toContain('Bearer ');
+      expect(kept).not.toContain('__semantos_session');
+    }
+  };
+
+  test('the hand copies: only the caller the brain names reaches the office, without the brain\'s credentials', () =>
+    deskBehindCaddy('hand', (p) => {
+      const swap = (text: string) => text.replaceAll('127.0.0.1:8082', `127.0.0.1:${p.brain}`).replaceAll(`127.0.0.1:${env.OFFICE_PORT}`, `127.0.0.1:${p.office}`);
+      return (
+        `${swap(site).replace('vouch.hillside.example.edu.au {', `http://127.0.0.1:${p.officeSite} {`)}\n` +
+        `http://127.0.0.1:${p.brainSite} {\n${swap(deskBlock)}\n\thandle {\n\t\treverse_proxy 127.0.0.1:${p.brain}\n\t}\n}\n`
+      );
+    }), 30_000);
+
+  test.skipIf(TEMPLATE === null)('the brain\'s template, its whole block: the same', () =>
+    deskBehindCaddy('template', (p) =>
+      TEMPLATE!.block
+        // Plain HTTP on this machine's ports: no certificate, and the log in the test's directory.
+        .replaceAll('    tls {\n        on_demand\n    }\n\n', '')
+        .replace('brain.hillside.example.edu.au {', `http://127.0.0.1:${p.brainSite} {`)
+        .replace('vouch.hillside.example.edu.au {', `http://127.0.0.1:${p.officeSite} {`)
+        .replace('/var/log/caddy/brain.hillside.example.edu.au.access.log', p.log)
+        .replaceAll('localhost:8082', `127.0.0.1:${p.brain}`)
+        .replaceAll('127.0.0.1:8082', `127.0.0.1:${p.brain}`)
+        .replaceAll(`127.0.0.1:${env.OFFICE_PORT}`, `127.0.0.1:${p.office}`),
+    ), 30_000);
 });

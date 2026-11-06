@@ -23,7 +23,8 @@ wallet, as for anything else on that brain. The desk calls
 `/api/v1/vouch/desk/*` on the brain's own host with the Helm's client, which
 carries the Helm's bearer for that brain; the desk holds no secret of its own.
 
-Caddy, on the brain's host (`brain-desk.caddy`):
+Caddy, on the brain's host (written by the brain's own Caddy template, below;
+`brain-desk.caddy` is the same block by hand):
 
 1. drops any `X-Semantos-Standing` or `X-Semantos-Cert-Id` the client sent;
 2. asks the brain who the bearer is (`forward_auth` to `GET /api/v1/auth/check`):
@@ -50,7 +51,7 @@ Every desk action is put down to who made it, in the office's own state:
 `vouchedBy` on each pickup, `withdrawnBy` on a withdrawn row, and `deskLog`,
 one entry per action with row ids and no name.
 
-The office's own site (`Caddyfile`) has no desk at all, and drops the identity
+The office's own site has no desk at all, and drops the identity
 headers on the way to the office too, whatever path a client tries.
 
 ### Registrars
@@ -89,14 +90,47 @@ routes take `Authorization: Bearer <token>`, the token `init` prints (and
 `cli.ts token` replaces), from anyone who has it. Serve says so loudly. Never
 deploy it.
 
+## The brain's Caddy writes it
+
+Nothing is pasted. The operator says the brain has an office, and the brain's
+own Caddy template (semantos-core `runtime/semantos-brain/src/caddy_template.zig`)
+writes the desk into the brain's site and the office's site beside it:
+
+- **A provisioned brain** (`brain provision-tenant <manifest.toml>`, the
+  attestor's brain): in its manifest,
+
+  ```toml
+  [vouch_office]
+  port = 8781                                    # OFFICE_PORT in /etc/vouch-office/<attestor>.env
+  public_host = "vouch.hillside.example.edu.au"  # the office's own site
+  ```
+
+  Provisioning writes both into `/etc/caddy/conf.d/<brain domain>.conf`, adds
+  the office's host to the on-demand TLS allowlist beside the brain's, and
+  keeps the block in the manifest's archive, so re-provisioning writes them
+  again. It refuses an office on the brain's port or on another brain's, and a
+  host that is the brain's.
+- **A brain from semantos-core `ops/brain/install.sh`**:
+  `BRAIN_VOUCH_OFFICE_PORT=8781 BRAIN_VOUCH_OFFICE_HOST=vouch.hillside.example.edu.au`.
+  The installer has the brain print the same two parts
+  (`brain caddy-vouch-office desk|site`) into its Caddyfile.
+
+`brain-desk.caddy` and `Caddyfile` here are the same two parts by hand, for a
+brain whose site block nothing writes: one behind a Caddyfile kept by hand
+(a docker-compose stack's, or a dockerized proxy's single Caddyfile), or one
+provisioned before the template knew the office. `test/office_deploy.test.ts`
+holds them line for line to the template's fixtures (in a semantos-core
+checkout beside this one, or at `SEMANTOS_CORE_DIR`) and runs Caddy in front
+of the office with each.
+
 ## Files
 
 | File | Goes to |
 |---|---|
 | `vouch-office@.service` | `/etc/systemd/system/` (one instance per attestor: `vouch-office@hillside`) |
 | `office.env.example` | `/etc/vouch-office/<attestor>.env`: the port, no secret |
-| `Caddyfile` | the office's public site, in `/etc/caddy/Caddyfile` beside the brain's |
-| `brain-desk.caddy` | a `handle` block, pasted into the brain's own site block (`/etc/caddy/conf.d/<brain domain>.conf`) |
+| `Caddyfile` | only by hand (above): the office's public site, beside the brain's |
+| `brain-desk.caddy` | only by hand (above): a `handle` block for the brain's own site block |
 
 ## Set up one attestor
 
@@ -121,16 +155,15 @@ cp bodies/office/deploy/office.env.example /etc/vouch-office/hillside.env   # th
 cp bodies/office/deploy/vouch-office@.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now vouch-office@hillside
 
-# Caddy: add the site from bodies/office/deploy/Caddyfile, with this attestor's
-# host and port; paste brain-desk.caddy into the brain's site block, with the
-# brain's port and the office's; then
+# Caddy: add [vouch_office] to the brain's manifest (above), with this
+# attestor's host and port, and re-provision the brain; it writes the desk and
+# the office's site. Then, unless provisioning reloaded Caddy itself,
 caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
 ```
 
 The brain must serve `GET /api/v1/auth/check` (semantos-core
 `runtime/semantos-brain/src/auth_check.zig`); a brain without it answers 404,
-which Caddy hands back, and the desk is shut. Re-provisioning the brain's site
-rewrites its block: paste the desk in again.
+which Caddy hands back, and the desk is shut.
 
 The DID document must be found where the did:web says. If the office is not at
 the did's host (here the did is the school's own domain and the office is at
@@ -151,5 +184,5 @@ did:web with a path is found at that path, so add it to `@public`.
   access log for the office's site: a pickup URL is a secret until it is used.
   The brain's site may keep one: the desk's paths carry no secret, and Caddy
   leaves credentials out of its logs.
-- **Another attestor on the same host** is another instance, port, site and
-  desk block.
+- **Another attestor on the same host** is another instance and port, beside
+  another brain whose manifest names it.

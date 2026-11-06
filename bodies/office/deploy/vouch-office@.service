@@ -11,7 +11,8 @@
 # The office listens on 127.0.0.1 only, and takes the desk only through the
 # brain (--desk-auth brain). Caddy, in front of it and of the brain, serves
 # its public routes to everyone, and /api/v1/vouch/desk/* on the brain's host
-# to a caller the brain names (brain-desk.caddy).
+# to a caller the brain names: both written by the brain's own Caddy template
+# from its manifest's [vouch_office], or by hand (Caddyfile, brain-desk.caddy).
 
 [Unit]
 Description=Vouch office for %i
