@@ -1,0 +1,38 @@
+# The registrar's desk, on the brain's own host, behind the brain's login
+# (bodies/office/deploy/README.md). The brain's Caddy template writes this
+# block when the brain's manifest has [vouch_office] (or install.sh has
+# BRAIN_VOUCH_OFFICE_PORT and _HOST): use that. This copy is for a brain whose
+# site block nothing writes. Put it in that site block, beside its
+# `handle /api/v1/*`, and replace the brain's port (8082) and the office's
+# (8781) with this host's. test/office_deploy.test.ts holds it, line for line,
+# to the template's.
+#
+# The desk in the Helm calls /api/v1/vouch/desk/* with the brain's own client,
+# which carries the Helm's bearer for this brain. Caddy asks the brain who that
+# bearer is (GET /api/v1/auth/check), and passes the request to the office's
+# /desk/* only if the brain says. The order inside `route` is the order Caddy
+# runs it, and it matters:
+#
+# 1. Whatever the client sent as the caller is dropped.
+# 2. The brain is asked. A 401 from it goes back to the client as it is; a 204
+#    sets the caller from its answer. A preflight carries no credential and is
+#    not asked about: the office answers it for its desk origins only.
+# 3. The brain's credentials go no further: the office never sees the bearer
+#    or a cookie, and refuses a request that carries either.
+# 4. /api/v1/vouch/desk/<route> becomes the office's /desk/<route>.
+
+handle /api/v1/vouch/desk/* {
+	route {
+		request_header -X-Semantos-Standing
+		request_header -X-Semantos-Cert-Id
+		@asked not method OPTIONS
+		forward_auth @asked 127.0.0.1:8082 {
+			uri /api/v1/auth/check
+			copy_headers X-Semantos-Standing X-Semantos-Cert-Id
+		}
+		request_header -Authorization
+		request_header -Cookie
+		uri strip_prefix /api/v1/vouch
+		reverse_proxy 127.0.0.1:8781
+	}
+}

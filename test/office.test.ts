@@ -30,6 +30,7 @@ import {
 import {
   COLLECT_NONCE,
   Office,
+  type OfficeHandlerOptions,
   PICKUP_MAX_SUBJECTS,
   PICKUP_TTL,
   collectProof,
@@ -89,8 +90,8 @@ interface Reply {
   headers: Headers;
 }
 
-async function call(h: Handler, method: string, path: string, body?: unknown, auth?: string): Promise<Reply> {
-  const headers: Record<string, string> = {};
+async function call(h: Handler, method: string, path: string, body?: unknown, auth?: string, extra: Record<string, string> = {}): Promise<Reply> {
+  const headers: Record<string, string> = { ...extra };
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (auth !== undefined) headers.authorization = auth;
   const res = await h(
@@ -107,7 +108,7 @@ async function call(h: Handler, method: string, path: string, body?: unknown, au
 /** Every public response this file sees, for the names scan. */
 const publicSeen: string[] = [];
 
-function makeOffice(name: string, claims: BodyClaim[] = ['member', 'guardian_of_member']) {
+function makeOffice(name: string, claims: BodyClaim[] = ['member', 'guardian_of_member'], handler: OfficeHandlerOptions = {}) {
   const { state, token } = initState({
     did: DID,
     anchorSk: anchor,
@@ -121,7 +122,7 @@ function makeOffice(name: string, claims: BodyClaim[] = ['member', 'guardian_of_
   const store = fileStore(path);
   store.save(state);
   const office = new Office(store, { now: () => clock });
-  const h = officeHandler(office);
+  const h = officeHandler(office, handler);
   const desk = (method: string, p: string, body?: unknown) => call(h, method, p, body, `Bearer ${token}`);
   const pub = async (method: string, p: string, body?: unknown) => {
     const r = await call(h, method, p, body);
@@ -184,6 +185,8 @@ describe('the pilot, end to end', () => {
       guardians: 2,
       consented: 4,
       vouched: 0,
+      vouchedMembers: 0,
+      vouchedGuardians: 0,
       awaitingPickup: 0,
       withdrawn: 0,
       liveVouches: 0,
@@ -341,7 +344,7 @@ describe('the pilot, end to end', () => {
       ['HP-G-0042a', END_2026],
       ['HP-G-0042b', END_2026],
     ]);
-    expect(needs.json.counts).toMatchObject({ vouched: 4, awaitingPickup: 0, liveVouches: 7 });
+    expect(needs.json.counts).toMatchObject({ vouched: 4, vouchedMembers: 2, vouchedGuardians: 2, awaitingPickup: 0, liveVouches: 7 });
   });
 
   test('withdrawing a child re-signs the list: the gate says withdrawn, the sibling still passes', async () => {
@@ -888,6 +891,7 @@ describe('the registrar token', () => {
     ['POST', '/desk/vouch', { ids: [] }],
     ['POST', '/desk/withdraw', { ids: [] }],
     ['GET', '/desk/needs'],
+    ['GET', '/desk/standing'],
   ];
 
   test('every registrar route refuses a missing or wrong token, and takes the right one', async () => {
@@ -910,6 +914,133 @@ describe('the registrar token', () => {
     const next = o.office.rotateToken();
     expect((await call(o.h, 'GET', '/desk/needs', undefined, `Bearer ${o.token}`)).status).toBe(401);
     expect((await call(o.h, 'GET', '/desk/needs', undefined, `Bearer ${next}`)).status).toBe(200);
+  });
+});
+
+describe('the standing', () => {
+  const o = makeOffice('standing');
+  const ANCHOR = anchor.toPublicKey().toString();
+
+  test('the registry entry, the nodes and the withdrawal list, as the desk shows them', async () => {
+    const r = await o.desk('GET', '/desk/standing');
+    expect(r.status).toBe(200);
+    const node = o.office.info().node;
+    expect(r.json).toEqual({
+      at: '2026-11-05T09:00:00Z',
+      entry: {
+        did: DID,
+        kind: 'school',
+        claims: ['member', 'guardian_of_member'],
+        periodEnds: [END_2026, END_2027],
+        steward: didKeyOfSecret(steward),
+        pilotSteward: true,
+        validFrom: '2026-11-04T09:00:00Z',
+        validUntil: END_2027,
+      },
+      didDocument: `${BASE}/.well-known/did.json`,
+      office: BASE,
+      anchor: ANCHOR,
+      node,
+      nodes: [node],
+      withdrawals: { url: STATUS_URL, signedAt: '2026-11-04T09:00:00Z', withdrawn: 0 },
+    });
+  });
+
+  test('a withdrawal signs the list again: the standing says when, and how many places it marks', async () => {
+    await o.desk('POST', '/desk/roster', { rows: ROSTER });
+    await o.desk('POST', '/desk/consent', { ids: ['HP-0042'], consent: true });
+    const v = await o.desk('POST', '/desk/vouch', { ids: ['HP-0042'] });
+    const code = codeOf(v.json.pickups[0].url);
+    for (const app of [RP, 'homework-club:online']) {
+      const sk = holder('mia', app);
+      const got = await o.pub('POST', `/pickup/${code}`, { proof: pickupProof({ subjectSk: sk, body: DID, code, at: clock }) });
+      expect(got.status).toBe(200);
+    }
+    clock += 3600;
+    await o.desk('POST', '/desk/withdraw', { ids: ['HP-0042'] });
+    const r = await o.desk('GET', '/desk/standing');
+    expect(r.json.at).toBe('2026-11-05T10:00:00Z');
+    expect(r.json.withdrawals).toEqual({ url: STATUS_URL, signedAt: '2026-11-05T10:00:00Z', withdrawn: 2 });
+  });
+
+  test('a new node is named first and the old one stays honoured, until it is retired', async () => {
+    const old = o.office.info().node;
+    const { node } = o.office.rotateNode(anchor);
+    const r = await o.desk('GET', '/desk/standing');
+    expect([r.json.node, r.json.nodes]).toEqual([node, [node, old]]);
+    expect(r.json.withdrawals.withdrawn).toBe(2);
+    o.office.retireNode(old);
+    expect((await o.desk('GET', '/desk/standing')).json.nodes).toEqual([node]);
+  });
+
+  test('it is the desk\'s alone, and carries no name', async () => {
+    expect((await call(o.h, 'GET', '/desk/standing')).status).toBe(401);
+    expect((await o.desk('POST', '/desk/standing', {})).status).toBe(405);
+    const text = (await o.desk('GET', '/desk/standing')).text;
+    for (const s of NAMES) expect(text).not.toContain(s);
+  });
+});
+
+describe('the desk from another origin', () => {
+  const DESK = 'https://brain.hillside.example.edu.au';
+  const o = makeOffice('cors', undefined, { deskOrigins: [DESK] });
+  const from = (origin: string, method: string, path: string, body?: unknown, auth?: string, extra: Record<string, string> = {}) =>
+    call(o.h, method, path, body, auth, { origin, ...extra });
+
+  test('a preflight from the desk\'s origin is answered with the route\'s methods and the bearer header', async () => {
+    for (const [path, methods] of [
+      ['/desk/vouch', 'POST'],
+      ['/desk/roster', 'GET, POST'],
+      ['/desk/standing', 'GET'],
+    ]) {
+      const r = await from(DESK, 'OPTIONS', path!, undefined, undefined, { 'access-control-request-method': 'POST' });
+      expect(r.status).toBe(204);
+      expect(r.headers.get('access-control-allow-origin')).toBe(DESK);
+      expect(r.headers.get('access-control-allow-methods')).toBe(methods!);
+      expect(r.headers.get('access-control-allow-headers')).toBe('authorization, content-type');
+      expect(r.headers.get('vary')).toBe('Origin');
+    }
+  });
+
+  test('from the desk\'s origin an answer carries the origin, and the token is still required', async () => {
+    const none = await from(DESK, 'GET', '/desk/needs');
+    expect([none.status, none.json.error]).toEqual([401, 'no_token']);
+    expect(none.headers.get('access-control-allow-origin')).toBe(DESK);
+    const bad = await from(DESK, 'GET', '/desk/needs', undefined, 'Bearer wrong');
+    expect(bad.status).toBe(401);
+    const ok = await from(DESK, 'POST', '/desk/roster', { rows: [{ id: 'c', kind: 'member', label: 'C' }] }, `Bearer ${o.token}`);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get('access-control-allow-origin')).toBe(DESK);
+    expect(ok.headers.get('vary')).toBe('Origin');
+  });
+
+  test('another origin, or none, gets no CORS answer from the desk', async () => {
+    for (const origin of ['https://evil.example', 'https://brain.hillside.example.edu.au:8443', 'http://brain.hillside.example.edu.au']) {
+      const pre = await from(origin, 'OPTIONS', '/desk/needs');
+      expect([pre.status, pre.json.error]).toEqual([403, 'origin_not_allowed']);
+      expect(pre.headers.get('access-control-allow-origin')).toBeNull();
+      // The office still answers the bearer; the browser keeps the answer from the page.
+      const r = await from(origin, 'GET', '/desk/needs', undefined, `Bearer ${o.token}`);
+      expect(r.status).toBe(200);
+      expect(r.headers.get('access-control-allow-origin')).toBeNull();
+    }
+    const plain = makeOffice('cors-none');
+    const pre = await call(plain.h, 'OPTIONS', '/desk/needs', undefined, undefined, { origin: DESK });
+    expect([pre.status, pre.json.error]).toEqual([403, 'origin_not_allowed']);
+    expect(pre.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  test('the public routes stay open to every origin', async () => {
+    const r = await from('https://evil.example', 'GET', '/status/1');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  test('a desk origin must be an origin', () => {
+    for (const bad of ['brain.example', 'https://brain.example/helm/', 'https://brain.example?x', 'ftp://brain.example', '*']) {
+      expect(() => officeHandler(o.office, { deskOrigins: [bad] })).toThrow(/desk origin/);
+    }
+    expect(() => officeHandler(o.office, { deskOrigins: ['http://localhost:5173', DESK] })).not.toThrow();
   });
 });
 
@@ -1028,6 +1159,19 @@ describe('the server', () => {
       server.stop(true);
     }
   });
+
+  test('answers the desk\'s origin over HTTP', async () => {
+    const o = makeOffice('server-cors');
+    const desk = 'https://brain.hillside.example.edu.au';
+    const server = serveOffice(o.office, { port: 0, hostname: '127.0.0.1', deskOrigins: [desk] });
+    try {
+      const pre = await fetch(`http://127.0.0.1:${server.port}/desk/needs`, { method: 'OPTIONS', headers: { origin: desk } });
+      expect(pre.status).toBe(204);
+      expect(pre.headers.get('access-control-allow-origin')).toBe(desk);
+    } finally {
+      server.stop(true);
+    }
+  });
 });
 
 describe('the CLI', () => {
@@ -1092,6 +1236,59 @@ describe('the CLI', () => {
     expect(run.code).toBe(0);
     expect(run.err).not.toContain('MUST NOT STEWARD');
     expect(JSON.parse(readFileSync(state, 'utf8')).registryEntry).toBe(made.registryEntry);
+  });
+
+  test('serve takes the desk\'s origin from --desk-origin, or from $OFFICE_DESK_ORIGIN', async () => {
+    const { state: made } = initState({
+      did: DID,
+      anchorSk: anchor,
+      stewardSk: steward,
+      kind: 'school',
+      claims: ['member', 'guardian_of_member'],
+      periodEnds: ends.split(','),
+      now: Math.floor(Date.now() / 1000),
+    });
+    const state = join(dir, 'cli-serve-office.json');
+    fileStore(state).save(made);
+    const desk = 'https://brain.hillside.example.edu.au';
+    const other = 'http://localhost:5173';
+    const serve = async (args: string[], env: Record<string, string> = {}) => {
+      const p = Bun.spawn([process.execPath, 'bodies/office/cli.ts', 'serve', '--state', state, '--port', '0', ...args], {
+        cwd: join(import.meta.dir, '..'),
+        env: { ...process.env, ...env },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const reader = p.stdout.getReader();
+      let out = '';
+      // The last line serve prints says where the desk is served from.
+      while (!/ desk from .*\n/.test(out)) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        out += new TextDecoder().decode(value);
+      }
+      return { p, base: /listening on (\S+)/.exec(out)![1]!, out };
+    };
+    const preflight = (base: string, origin: string) => fetch(`${base}/desk/needs`, { method: 'OPTIONS', headers: { origin } });
+
+    const a = await serve(['--desk-origin', `${desk},${other}`]);
+    try {
+      expect(a.out).toContain(`desk from ${desk}, ${other}`);
+      expect((await preflight(a.base, desk)).headers.get('access-control-allow-origin')).toBe(desk);
+      expect((await preflight(a.base, other)).headers.get('access-control-allow-origin')).toBe(other);
+      expect((await preflight(a.base, 'https://evil.example')).status).toBe(403);
+    } finally {
+      a.p.kill();
+    }
+    const b = await serve([], { OFFICE_DESK_ORIGIN: desk });
+    try {
+      expect((await preflight(b.base, desk)).headers.get('access-control-allow-origin')).toBe(desk);
+    } finally {
+      b.p.kill();
+    }
+    const bad = cli('serve', '--state', state, '--port', '0', '--desk-origin', 'https://brain.example/helm/');
+    expect(bad.code).not.toBe(0);
+    expect(bad.err).toContain('desk origin');
   });
 
   test('rotate-node with the anchor key file, then retire-node for the old node', () => {

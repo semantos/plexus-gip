@@ -32,6 +32,37 @@ export const OFFICE_STATE_VERSION = 2;
 
 export type RosterKind = 'member' | 'guardian';
 
+/**
+ * Who did something at the desk. Behind the brain (`--desk-auth brain`), the
+ * caller the brain named: its standing there and, for a member, the identity
+ * its wallet login names (a page-0 cert id). With the development token,
+ * only that the token was used.
+ */
+export interface DeskActor {
+  standing: 'operator' | 'admin' | 'member' | 'dev-token';
+  /** 32 hex, when the brain named one. */
+  certId?: string;
+}
+
+/** A member the operator lets use the desk, by the identity the brain names for them. */
+export interface Registrar {
+  /** The member's page-0 cert id, 32 lowercase hex. */
+  certId: string;
+  /** The operator's name for them, for `registrars list`. Never sent anywhere. */
+  label?: string;
+  addedAt: string;
+}
+
+/** One desk action, as the office's own record of who did what. Row ids only: no name. */
+export interface DeskEntry {
+  at: string;
+  by: DeskActor;
+  action: 'roster' | 'consent' | 'vouch' | 'withdraw';
+  ids: string[];
+  /** For consent: given or taken away. */
+  consent?: boolean;
+}
+
 /** One person on the body's own roster. */
 export interface RosterRow {
   id: string;
@@ -48,6 +79,8 @@ export interface RosterRow {
   withdrawnAt?: string;
   /** The registrar's note at withdrawal: a guardian may sponsor the child onward. */
   sponsorNote?: boolean;
+  /** Who withdrew the row's vouches. */
+  withdrawnBy?: DeskActor;
 }
 
 /** A vouch the node signed, with enough to sign it again: byte for byte while the node is the same. */
@@ -76,6 +109,8 @@ export interface Pickup {
   validUntil: string;
   /** Each subject that collected a vouch with this code, and its status index. */
   redeemed: { subject: string; statusIndex: number }[];
+  /** Who vouched the row. */
+  vouchedBy?: DeskActor;
   cancelledAt?: string;
   /**
    * When the row was withdrawn. A pickup is also the registrar's word that
@@ -108,8 +143,12 @@ export interface OfficeState {
   pilotSteward: boolean;
   /** The current withdrawal list JWT. */
   statusList: string;
-  /** sha256 of the registrar's bearer token, hex. */
+  /** sha256 of the development token (`--desk-auth dev-token`), hex. */
   tokenHash: string;
+  /** The members who may use the desk behind the brain, besides the operator. */
+  registrars: Registrar[];
+  /** Every desk action, oldest first: who did it, to which rows. */
+  deskLog: DeskEntry[];
   roster: RosterRow[];
   vouches: IssuedVouch[];
   /** How many places on the withdrawal list are taken. Places are chosen at random, never in order. */
@@ -148,6 +187,10 @@ function parseState(text: string): OfficeState {
   if (s?.version !== OFFICE_STATE_VERSION) throw new WireError('bad_state', `not an office state file, version ${OFFICE_STATE_VERSION}`);
   for (const k of ['roster', 'vouches', 'pickups', 'delegations']) if (!Array.isArray(s[k])) throw new WireError('bad_state', `${k} is missing`);
   if (s.delegations.length === 0) throw new WireError('bad_state', 'no delegation for the current node');
+  // A file from before the registrar list and the desk's record has neither yet.
+  s.registrars ??= [];
+  s.deskLog ??= [];
+  for (const k of ['registrars', 'deskLog']) if (!Array.isArray(s[k])) throw new WireError('bad_state', `${k} is not a list`);
   return s;
 }
 
@@ -163,7 +206,7 @@ export function fileStore(path: string): Store {
 
 export const hashToken = (token: string): string => createHash('sha256').update(token, 'utf8').digest('hex');
 
-/** A registrar token: 256 random bits, base64url. */
+/** A development token: 256 random bits, base64url. */
 export const newToken = (): string => b64url(new Uint8Array(randomBytes(32)));
 
 // ── did:web ──────────────────────────────────────────────────────────────────
@@ -211,8 +254,9 @@ export type InitOptions = InitWithEntry | InitWithSteward;
 
 /**
  * A new office: a fresh node key, the anchor's delegation of it, the registry
- * entry, an empty withdrawal list and a registrar token. The token is returned
- * once and only its hash is kept.
+ * entry, an empty withdrawal list, no registrars, and a development token
+ * (`--desk-auth dev-token`). The token is returned once and only its hash is
+ * kept.
  */
 export function initState(o: InitOptions): { state: OfficeState; token: string } {
   const baseUrl = originOf(o.baseUrl ?? didWebOrigin(o.did));
@@ -259,6 +303,8 @@ export function initState(o: InitOptions): { state: OfficeState; token: string }
     pilotSteward: !('entry' in o),
     statusList: issueStatusList(node, { issuer: o.did, delegations, url: entry.statusList, revoked: [], validFrom: o.now }),
     tokenHash: hashToken(token),
+    registrars: [],
+    deskLog: [],
     roster: [],
     vouches: [],
     nextStatusIndex: 0,

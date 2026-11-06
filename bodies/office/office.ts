@@ -38,9 +38,12 @@ import {
   verifyJwtByKid,
 } from '../../src';
 import {
+  type DeskActor,
+  type DeskEntry,
   type IssuedVouch,
   type OfficeState,
   type Pickup,
+  type Registrar,
   type RosterKind,
   type RosterRow,
   type Store,
@@ -185,6 +188,9 @@ export interface Needs {
     consented: number;
     /** Rows with a live vouch. */
     vouched: number;
+    /** Of those, members and guardians. */
+    vouchedMembers: number;
+    vouchedGuardians: number;
     /** Rows with a code out and no live vouch yet. */
     awaitingPickup: number;
     withdrawn: number;
@@ -200,6 +206,40 @@ export interface Needs {
   lapsing: (NeedsItem & { lapsesAt: string })[];
   /** Consent withdrawn, and a vouch still live. */
   consentWithdrawn: NeedsItem[];
+}
+
+/** Where the body stands, for the desk: its registry entry, its nodes and its withdrawal list. */
+export interface Standing {
+  at: string;
+  /** The registry entry, as its steward signed it. */
+  entry: {
+    did: string;
+    kind: BodyKind;
+    claims: readonly BodyClaim[];
+    periodEnds: readonly string[];
+    /** The steward's did:key. */
+    steward: string;
+    /** True when the entry was signed here with a local steward key: a pilot only. */
+    pilotSteward: boolean;
+    validFrom: string;
+    validUntil: string;
+  };
+  /** Where the DID document must be found for the did:web to resolve. */
+  didDocument: string;
+  /** Where the office is reached. */
+  office: string;
+  anchor: string;
+  /** The node that signs, compressed hex. */
+  node: string;
+  /** Every node the withdrawal list honours, the signing node first. */
+  nodes: string[];
+  withdrawals: {
+    url: string;
+    /** When the list now published was signed: at init, a withdrawal or a change of node. */
+    signedAt: string;
+    /** How many places it marks withdrawn. */
+    withdrawn: number;
+  };
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -231,7 +271,16 @@ function tidy(r: RosterRow): RosterRow {
     ...(r.leavingOn !== undefined && { leavingOn: r.leavingOn }),
     ...(r.withdrawnAt !== undefined && { withdrawnAt: r.withdrawnAt }),
     ...(r.sponsorNote !== undefined && { sponsorNote: r.sponsorNote }),
+    ...(r.withdrawnBy !== undefined && { withdrawnBy: r.withdrawnBy }),
   };
+}
+
+/** A page-0 cert id as the brain spells one: 32 lowercase hex. */
+export const CERT_ID = /^[0-9a-f]{32}$/;
+
+/** Note a desk action in the office's own record. */
+function logDesk(s: OfficeState, now: number, by: DeskActor, action: DeskEntry['action'], ids: string[], extra: Partial<DeskEntry> = {}): void {
+  s.deskLog.push({ at: isoSeconds(now), by: { ...by }, action, ids: [...ids], ...extra });
 }
 
 function idList(ids: unknown): string[] {
@@ -530,7 +579,42 @@ export class Office {
     return want.length === got.length && timingSafeEqual(want, got);
   }
 
-  /** A new registrar token. The old one stops working. */
+  /** Is `certId` on the registrar list? */
+  isRegistrar(certId: string): boolean {
+    return this.read((s) => s.registrars.some((r) => r.certId === certId));
+  }
+
+  registrars(): Registrar[] {
+    return this.read((s) => s.registrars.map((r) => ({ ...r })));
+  }
+
+  /** Let a member use the desk, by the identity the brain names for them. Adding one already listed changes nothing. */
+  addRegistrar(certId: string, label?: string): { added: boolean; registrars: Registrar[] } {
+    if (!CERT_ID.test(certId)) throw new OfficeError(400, 'bad_cert_id', 'a registrar is named by a page-0 cert id, 32 lowercase hex');
+    if (label !== undefined && (label.trim() === '' || label.length > 200)) throw new OfficeError(400, 'bad_label', 'a label is 1 to 200 characters');
+    return this.write((s, now) => {
+      const added = !s.registrars.some((r) => r.certId === certId);
+      if (added) s.registrars.push({ certId, ...(label !== undefined && { label }), addedAt: isoSeconds(now) });
+      return { added, registrars: s.registrars.map((r) => ({ ...r })) };
+    });
+  }
+
+  /** Take a member off the list: their next desk request is refused. */
+  removeRegistrar(certId: string): { registrars: Registrar[] } {
+    return this.write((s) => {
+      const i = s.registrars.findIndex((r) => r.certId === certId);
+      if (i < 0) throw new OfficeError(404, 'not_a_registrar', `${certId} is not on the list`);
+      s.registrars.splice(i, 1);
+      return { registrars: s.registrars.map((r) => ({ ...r })) };
+    });
+  }
+
+  /** The office's record of desk actions, oldest first. */
+  deskLog(): DeskEntry[] {
+    return this.read((s) => s.deskLog.map((e) => ({ ...e, by: { ...e.by }, ids: [...e.ids] })));
+  }
+
+  /** A new development token. The old one stops working. */
   rotateToken(): string {
     const token = newToken();
     this.write((s) => {
@@ -576,6 +660,38 @@ export class Office {
     });
   }
 
+  /** Where the body stands: what the desk shows beside its home list. */
+  standing(): Standing {
+    return this.read((s, now) => {
+      const e = this.entry(s);
+      const list = verifyJwtByKid(s.statusList);
+      if (list === null || typeof list.payload.validFrom !== 'string') throw new OfficeError(500, 'bad_state', 'the withdrawal list does not verify');
+      return {
+        at: isoSeconds(now),
+        entry: {
+          did: e.did,
+          kind: e.kind,
+          claims: e.claims,
+          periodEnds: e.periodEnds,
+          steward: e.steward,
+          pilotSteward: s.pilotSteward,
+          validFrom: e.validFrom,
+          validUntil: e.validUntil,
+        },
+        didDocument: `${didWebOrigin(s.did)}${didWebPath(s.did)}`,
+        office: s.baseUrl,
+        anchor: s.anchor,
+        node: this.node(s).toPublicKey().toString(),
+        nodes: this.honoured(s),
+        withdrawals: {
+          url: e.statusList,
+          signedAt: list.payload.validFrom,
+          withdrawn: s.vouches.filter((v) => v.withdrawnAt !== undefined).length,
+        },
+      };
+    });
+  }
+
   rows(): RosterRow[] {
     return this.read((s) => s.roster.map(tidy));
   }
@@ -585,9 +701,9 @@ export class Office {
    * random one. On an update, fields given replace, null clears, and the rest
    * stay. A row's kind is fixed once set. Consent goes through {@link setConsent}.
    */
-  upsertRows(input: unknown): RosterRow[] {
+  upsertRows(input: unknown, by: DeskActor): RosterRow[] {
     if (!Array.isArray(input)) throw new OfficeError(400, 'bad_request', 'rows must be an array');
-    return this.write((s) => {
+    return this.write((s, now) => {
       const byId = new Map(s.roster.map((r) => [r.id, r]));
       const touched: string[] = [];
       input.forEach((raw: any, i) => {
@@ -629,12 +745,14 @@ export class Office {
         if (notMember.length > 0) throw new OfficeError(400, 'bad_row', `rows[${i}]: guardianOf names no member ${notMember.join(', ')}`);
       }
       s.roster = [...byId.values()].map(tidy);
-      return [...new Set(touched)].map((id) => tidy(byId.get(id)!));
+      const ids = [...new Set(touched)];
+      logDesk(s, now, by, 'roster', ids);
+      return ids.map((id) => tidy(byId.get(id)!));
     });
   }
 
   /** Record consent, or its withdrawal. Withdrawing it cancels any code still out. */
-  setConsent(ids: unknown, consent: unknown): { updated: string[]; cancelledPickups: number } {
+  setConsent(ids: unknown, consent: unknown, by: DeskActor): { updated: string[]; cancelledPickups: number } {
     if (typeof consent !== 'boolean') throw new OfficeError(400, 'bad_request', 'consent is true or false');
     return this.write((s, now) => {
       const rows = pickRows(s, ids);
@@ -643,6 +761,7 @@ export class Office {
         r.consent = consent;
         if (!consent) cancelledPickups += cancelPickups(s, r.id, now);
       }
+      logDesk(s, now, by, 'consent', rows.map((r) => r.id), { consent });
       return { updated: rows.map((r) => r.id), cancelledPickups };
     });
   }
@@ -653,7 +772,7 @@ export class Office {
    * gives ends at `periodEnd`, by default the next of the entry's period ends,
    * and the code lasts seven days or to that end, whichever is sooner.
    */
-  vouch(ids: unknown, periodEnd?: unknown): { pickups: PickupSlip[]; refused: { id: string; reason: VouchRefusal }[] } {
+  vouch(ids: unknown, periodEnd: unknown, by: DeskActor): { pickups: PickupSlip[]; refused: { id: string; reason: VouchRefusal }[] } {
     return this.write((s, now) => {
       const entry = this.entry(s);
       const ahead = entry.periodEnds.filter((p) => at(p) > now).sort();
@@ -703,12 +822,15 @@ export class Office {
           validFrom: isoSeconds(dayStart(now)),
           validUntil,
           redeemed: [],
+          vouchedBy: { ...by },
         });
         // Vouching a withdrawn row again is the registrar's decision to take it back.
         delete r.withdrawnAt;
         delete r.sponsorNote;
+        delete r.withdrawnBy;
         pickups.push({ id, label: r.label, claim, url: `${s.baseUrl}/pickup/${code}`, expiresAt, validUntil });
       }
+      if (pickups.length > 0) logDesk(s, now, by, 'vouch', pickups.map((p) => p.id));
       return { pickups, refused };
     });
   }
@@ -718,7 +840,11 @@ export class Office {
    * the withdrawal list again. `sponsorNote` records that a guardian may
    * sponsor the child onward; it stays on the roster.
    */
-  withdraw(ids: unknown, sponsorNote?: unknown): { withdrawn: { id: string; statusIndexes: number[] }[]; cancelledPickups: number } {
+  withdraw(
+    ids: unknown,
+    sponsorNote: unknown,
+    by: DeskActor,
+  ): { withdrawn: { id: string; statusIndexes: number[] }[]; cancelledPickups: number } {
     if (sponsorNote !== undefined && typeof sponsorNote !== 'boolean') throw new OfficeError(400, 'bad_request', 'sponsorNote is true or false');
     return this.write((s, now) => {
       const rows = pickRows(s, ids);
@@ -728,6 +854,7 @@ export class Office {
       const withdrawn = rows.map((r) => {
         r.withdrawnAt = stamp;
         r.sponsorNote = sponsorNote === true;
+        r.withdrawnBy = { ...by };
         cancelledPickups += cancelPickups(s, r.id, now);
         // Every vouch of the row made so far is void, for renewal too.
         for (const p of s.pickups) if (p.rosterId === r.id) p.withdrawnAt ??= stamp;
@@ -742,6 +869,7 @@ export class Office {
         return { id: r.id, statusIndexes };
       });
       if (changed) this.resign(s, now);
+      logDesk(s, now, by, 'withdraw', rows.map((r) => r.id));
       return { withdrawn, cancelledPickups };
     });
   }
@@ -814,6 +942,8 @@ export class Office {
           guardians: s.roster.filter((r) => r.kind === 'guardian').length,
           consented: s.roster.filter((r) => r.consent).length,
           vouched: current.filter((r) => hasLive(r.id)).length,
+          vouchedMembers: current.filter((r) => r.kind === 'member' && hasLive(r.id)).length,
+          vouchedGuardians: current.filter((r) => r.kind === 'guardian' && hasLive(r.id)).length,
           awaitingPickup: current.filter((r) => hasOpen(r.id) && !hasLive(r.id)).length,
           withdrawn: s.roster.filter((r) => r.withdrawnAt !== undefined).length,
           liveVouches: [...live.values()].reduce((n, l) => n + l.length, 0),

@@ -152,17 +152,54 @@ one, 1,984 with two), and an app fetches it once for the whole body.
 ## 6. The office
 
 `bodies/office/` is the body's issuing service, a library and a Bun HTTP server
-run by or for one body (`bun run office init`, `serve`, `token`, `rotate-node`,
-`retire-node`). Its state is one JSON file, mode 0600, written atomically: the
-node key, the delegations the body honours (the current node's first), the
-registry entry, the roster, the vouches and the pickups. The anchor key signs
+run by or for one body (`bun run office init`, `serve`, `registrars`, `token`,
+`rotate-node`, `retire-node`). Its state is one JSON file, mode 0600, written
+atomically: the node key, the delegations the body honours (the current node's
+first), the registry entry, the roster, the vouches and the pickups, the
+registrars and the desk's record of who did what. The anchor key signs
 a node's delegation at `init` and at `rotate-node`, and is not kept. Names stay
 on the roster: no public answer and no vouch carries a label, group or roster
 id (the tests scan them).
 
-- **The desk**, behind a bearer token stored hashed: add rows, record consent,
+- **The desk**: add rows, record consent,
   vouch a class, withdraw a family (with a "guardian may sponsor onward" note),
-  and `GET /desk/needs`, the home list of what needs the school.
+  `GET /desk/needs`, the home list of what needs the school (its counts split
+  the rows vouched into members and guardians), and `GET /desk/standing`,
+  where the body stands: the registry entry as its steward signed it (did,
+  kind, claims, period ends, the steward, whether it is a pilot's own, when it
+  holds), the DID document's place, the anchor, the signing node and every
+  node the list honours, and the withdrawal list (its URL, when the list now
+  published was signed, and how many places it marks withdrawn).
+- **Who may use the desk** (`serve --desk-auth`). The registrar's desk is the
+  vouch cartridge in the Helm (semantos-core `packages/vouch_experience`).
+  - `brain`, for a deploy: the registrar signs in to the body's brain in the
+    Helm, and the desk calls `/api/v1/vouch/desk/*` on the brain's host with
+    the Helm's own client, so it holds no secret. Caddy there drops any
+    `X-Semantos-Standing` or `X-Semantos-Cert-Id` the client sent, asks the
+    brain who the bearer is (`forward_auth` to `GET /api/v1/auth/check`, which
+    answers 204 with the standing and the page-0 cert id its wallet login
+    names, or 401), sets the two headers from that answer, drops
+    `Authorization` and `Cookie`, and passes the request on as `/desk/*`. The
+    office takes it only over loopback or its own unix socket, only with the
+    headers and without the brain's credentials (a request still carrying
+    either is 400 `brain_credential_forwarded`), and only from the brain's
+    operator (or admin) or a member whose cert id is on its registrar list
+    (`registrars add|remove|list`): anyone else is 403 `not_a_registrar`,
+    with what to do. A hat, a device or an agent's bearer is not a registrar.
+    `GET /desk/whoami` says who the office takes the caller to be and whether
+    it lets them in. `deploy/` has the Caddy blocks.
+  - `dev-token`, the default, for development only: `Authorization: Bearer
+    <token>`, stored hashed, made at `init` and by `token`. `serve` says so.
+  Every desk action is put down to who made it: `vouchedBy` on a pickup,
+  `withdrawnBy` on a withdrawn row, and one `deskLog` entry per action, by row
+  id, with no name.
+- **The desk's origin.** A Helm served from another origin than the brain's
+  host is a browser on that origin, so `serve --desk-origin <origin>[,<origin>]`
+  (or `$OFFICE_DESK_ORIGIN`) names the origins a browser may call `/desk/*`
+  from. A preflight from one gets the route's methods and the `authorization`
+  header; any other is 403 `origin_not_allowed`; an answer to one carries it,
+  with `Vary: Origin`. This is CORS, not a lock: the desk still asks who is
+  calling, from any origin. The Helm the brain serves needs none.
 - **Pickup.** Vouching a consented row makes a one-time 128-bit code, good for
   seven days or to the period end. The parent's phone reads what the body will
   and will not say, then each app's key collects its own vouch with a proof
@@ -210,3 +247,22 @@ id (the tests scan them).
   each change of node, `/pickup/<code>` and `POST /collect`. A pilot may sign
   its own entry with a local steward key; `init` warns that a body must not
   steward itself.
+- **Where it runs** (Todd's decision, 5 November 2026). Each attestor gets a
+  semantos brain from the operator, with the workspace cartridge as its home,
+  and its office runs beside that brain on the same host in Australia, behind
+  the same Caddy: not inside the brain, and not on Cloudflare, since it holds
+  the node key and the children's names. `bodies/office/deploy/` has the
+  recipe: `vouch-office@.service`, one instance per attestor, runs
+  `bun --no-install run bodies/office/cli.ts serve --desk-auth brain` on
+  127.0.0.1 with its state in `/var/lib/vouch-office/<attestor>/` (0700) and
+  its port from `/etc/vouch-office/<attestor>.env`, which holds no secret; the
+  `Caddyfile` site serves `/.well-known/did.json`, `/status/*`, `/pickup/*`
+  and `/collect` to everyone with no caller passed on, no desk, 404 for the
+  rest, and keeps no access log, since a pickup URL is a secret until it is
+  used; `brain-desk.caddy` is the desk's block for the brain's own site. The
+  brain's own Caddy template (semantos-core `caddy_template.zig`) writes both
+  when the brain's manifest has `[vouch_office]`; these two are the same by
+  hand, and a test holds them to the template's. Its
+  README covers init with the anchor key kept offline, a DID document
+  published at the did's host when the office is elsewhere, and backups of
+  the state file, encrypted and in Australia.
