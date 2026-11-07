@@ -32,6 +32,7 @@ import {
   issueStatusList,
   issueVouch,
   parseIsoSeconds,
+  publicKeyFromDidKey,
   readDelegation,
   readRegistryEntry,
   signJwt,
@@ -115,13 +116,81 @@ export const COLLECT_NONCE = 'collect';
 /** The holder's proof of its key when it collects its vouches: a pickup proof with the nonce `collect`. */
 export const collectProof = (p: Omit<PickupProofInput, 'code'>): string => pickupProof({ ...p, code: COLLECT_NONCE });
 
-/** The did:key that signed a proof for this body and code, now. */
-function proofSubject(proof: unknown, did: string, code: string, now: number): string {
+/**
+ * Extending to a new place (decision 12 of semantos-core
+ * `docs/design/CLAIMS-AND-REQUIREMENTS.md`, §3.3, tabletop F3). A pickup names
+ * the places chosen at the desk; for a place chosen later, a collect by the
+ * new place's key carries a second proof, by a key the office already
+ * vouches for, and the office makes out to the new key what that key holds:
+ *
+ *     POST /collect { proof, extend, guardian? }
+ *
+ * - `proof`: {@link collectProof}, by the new key.
+ * - `extend`: {@link extendProof}, by the held key, naming the new key, which
+ *   binds the two: an `extend` seen in passing makes out nothing to anyone
+ *   else's key.
+ * - `guardian`: {@link guardianProof}, by a key holding a live vouch of a
+ *   guardian row whose `guardianOf` names the held key's row, also naming the
+ *   new key. Required when the row is a child's, a member row some guardian
+ *   row names, because a child's places are the guardian's choice.
+ *
+ * All three are pickup proofs, `openid4vci-proof+jwt` `{aud, nonce, iat}`,
+ * each within {@link PRESENTATION_MAX_SKEW} of the office's clock.
+ */
+export const extendNonce = (newSubject: string): string => `extend:${newSubject}`;
+
+/** The nonce of a guardian's consent to a child's new place. */
+export const guardianNonce = (newSubject: string): string => `guardian:${newSubject}`;
+
+/** How many keys one row's live vouches may be made out to by extension, all told. */
+export const ROW_MAX_PLACES = 16;
+
+export interface ExtendProofInput {
+  /** A key the body already vouches for: the holder's key at a place it holds the vouch for. */
+  heldSk: PrivateKey;
+  /** The body's did:web. */
+  body: string;
+  /** The new place's key, as a did:key. */
+  newSubject: string;
+  /** Unix seconds. */
+  at: number;
+}
+
+/** The held key's word, to this body, that its vouches be made out to `newSubject` too. */
+export function extendProof(p: ExtendProofInput): string {
+  publicKeyFromDidKey(p.newSubject);
+  return pickupProof({ subjectSk: p.heldSk, body: p.body, code: extendNonce(p.newSubject), at: p.at });
+}
+
+export interface GuardianProofInput {
+  /** The guardian's key that holds their guardian_of_member vouch from this body. */
+  guardianSk: PrivateKey;
+  /** The body's did:web. */
+  body: string;
+  /** The child's new place key, as a did:key. */
+  newSubject: string;
+  /** Unix seconds. */
+  at: number;
+}
+
+/** A guardian's word, to this body, that the child's vouches be made out to `newSubject` too. */
+export function guardianProof(p: GuardianProofInput): string {
+  publicKeyFromDidKey(p.newSubject);
+  return pickupProof({ subjectSk: p.guardianSk, body: p.body, code: guardianNonce(p.newSubject), at: p.at });
+}
+
+/**
+ * The did:key that signed a proof for this body and nonce, now. A refusal of
+ * `extend` or `guardian` names the field in its detail, and a malformed one
+ * is `bad_extend` or `bad_guardian`.
+ */
+function proofSubject(proof: unknown, did: string, nonce: string, now: number, field: 'proof' | 'extend' | 'guardian' = 'proof'): string {
+  const refuse = (code: string) => (field === 'proof' ? new OfficeError(400, code) : new OfficeError(400, code, field));
   const v = typeof proof === 'string' ? verifyJwtByKid(proof, PICKUP_PROOF_TYP) : null;
-  if (v === null || !Number.isSafeInteger(v.payload.iat)) throw new OfficeError(400, 'bad_proof');
-  if (v.payload.aud !== did) throw new OfficeError(400, 'wrong_audience');
-  if (v.payload.nonce !== code) throw new OfficeError(400, 'wrong_nonce');
-  if (Math.abs(now - v.payload.iat) > PRESENTATION_MAX_SKEW) throw new OfficeError(400, 'stale');
+  if (v === null || !Number.isSafeInteger(v.payload.iat)) throw new OfficeError(400, `bad_${field}`);
+  if (v.payload.aud !== did) throw refuse('wrong_audience');
+  if (v.payload.nonce !== nonce) throw refuse('wrong_nonce');
+  if (Math.abs(now - v.payload.iat) > PRESENTATION_MAX_SKEW) throw refuse('stale');
   return v.signer;
 }
 
@@ -518,19 +587,93 @@ export class Office {
    * holding a vouch of that row, live or lapsed, gets that period's vouch
    * here, issued now at a new place, with no code. A withdrawn row, or one
    * without consent, gets nothing new.
+   *
+   * Extension: with `extend` (and, for a child, `guardian`), each live vouch
+   * about the held key is first made out to the proof's key, see
+   * {@link extendNonce}.
    */
-  collect(proof: unknown): { vouches: string[] } {
+  collect(proof: unknown, extend?: unknown, guardian?: unknown): { vouches: string[] } {
     const s = this.store.load();
     const now = this.now();
     const subject = proofSubject(proof, s.did, COLLECT_NONCE, now);
+    if (extend === undefined && guardian !== undefined) throw new OfficeError(400, 'bad_request', 'guardian goes with extend');
+    const extended = extend !== undefined && this.extend(s, subject, extend, guardian, now);
     const renewed = this.renew(s, subject, now);
     const vouches = s.vouches
       .filter((v) => v.subject === subject && isLive(v, now))
       .sort((a, b) => b.validUntil.localeCompare(a.validUntil) || b.issuedAt.localeCompare(a.issuedAt) || a.statusIndex - b.statusIndex)
       .map((v) => this.sign(s, v));
-    // A collect is a read, unless it issued a renewal.
-    if (renewed) this.store.save(s);
+    // A collect is a read, unless it issued an extension or a renewal.
+    if (extended || renewed) this.store.save(s);
     return { vouches };
+  }
+
+  /**
+   * Make out to `subject` each live vouch about the key that signed `extend`:
+   * the same row, claim, validFrom and validUntil, at a new place. True if any
+   * was issued.
+   *
+   * A held key with nothing live, or whose row has no consent, adds nothing,
+   * so the answer is the plain collect's: an unknown key cannot be told from
+   * a known one with nothing live. Withdrawal is by row, so withdrawing the
+   * row withdraws every copy.
+   */
+  private extend(s: OfficeState, subject: string, extend: unknown, guardian: unknown, now: number): boolean {
+    const held = proofSubject(extend, s.did, extendNonce(subject), now, 'extend');
+    if (held === subject) throw new OfficeError(400, 'same_key', 'extend');
+    const guardianKey = guardian === undefined ? undefined : proofSubject(guardian, s.did, guardianNonce(subject), now, 'guardian');
+    const live = s.vouches.filter((v) => v.subject === held && isLive(v, now));
+    // One key holds one row's vouches, so the held key's live vouches are all of one row.
+    const rosterId = live[0]?.rosterId;
+    if (rosterId === undefined) return false;
+    const row = s.roster.find((r) => r.id === rosterId);
+    if (row === undefined || !row.consent || row.withdrawnAt !== undefined) return false;
+    // One key, one person, as at a pickup.
+    if (s.vouches.some((v) => v.subject === subject && v.rosterId !== rosterId)) {
+      throw new OfficeError(409, 'subject_taken', 'this key already holds a vouch for someone else');
+    }
+    if (this.isChild(s, row)) {
+      if (guardianKey === undefined) throw new OfficeError(403, 'guardian_required', 'a child\'s new place needs a guardian\'s proof');
+      if (!this.guards(s, guardianKey, rosterId, now)) throw new OfficeError(403, 'not_guardian', 'that key holds no live vouch as this child\'s guardian');
+    }
+    const keys = new Set(s.vouches.filter((v) => v.rosterId === rosterId && v.withdrawnAt === undefined).map((v) => v.subject));
+    let issued = false;
+    for (const v of live) {
+      const has = s.vouches.some(
+        (x) => x.subject === subject && x.rosterId === rosterId && x.claim === v.claim && x.validUntil === v.validUntil && x.withdrawnAt === undefined,
+      );
+      if (has) continue;
+      if (!keys.has(subject) && keys.size >= ROW_MAX_PLACES) throw new OfficeError(409, 'too_many_places', `a row's vouches go to at most ${ROW_MAX_PLACES} keys`);
+      if (s.nextStatusIndex >= STATUS_LIST_BITS) throw new OfficeError(507, 'status_list_full');
+      s.vouches.push({
+        statusIndex: unusedStatusIndex(s.vouches),
+        rosterId,
+        claim: v.claim,
+        subject,
+        validFrom: v.validFrom,
+        issuedAt: isoSeconds(now),
+        validUntil: v.validUntil,
+      });
+      s.nextStatusIndex++;
+      keys.add(subject);
+      issued = true;
+    }
+    return issued;
+  }
+
+  /** A child's row: a member row some guardian row names. */
+  private isChild(s: OfficeState, row: RosterRow): boolean {
+    return row.kind === 'member' && s.roster.some((g) => g.kind === 'guardian' && (g.guardianOf ?? []).includes(row.id));
+  }
+
+  /** Does `key` hold a live vouch of a current, consented guardian row of the member `rosterId`? */
+  private guards(s: OfficeState, key: string, rosterId: string, now: number): boolean {
+    const rows = new Set(
+      s.roster
+        .filter((g) => g.kind === 'guardian' && g.consent && g.withdrawnAt === undefined && (g.guardianOf ?? []).includes(rosterId))
+        .map((g) => g.id),
+    );
+    return s.vouches.some((v) => v.subject === key && rows.has(v.rosterId) && v.claim === 'guardian_of_member' && isLive(v, now));
   }
 
   /** Issue the later periods the subject's rows are vouched for that it does not hold. True if any. */

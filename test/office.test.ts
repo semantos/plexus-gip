@@ -34,8 +34,13 @@ import {
   type OfficeHandlerOptions,
   PICKUP_MAX_SUBJECTS,
   PICKUP_TTL,
+  ROW_MAX_PLACES,
   collectProof,
+  extendNonce,
+  extendProof,
   fileStore,
+  guardianNonce,
+  guardianProof,
   initState,
   officeHandler,
   pickupProof,
@@ -46,6 +51,7 @@ const key = (label: string): PrivateKey =>
   PrivateKey.fromString(createHash('sha256').update(`gip-v2-office-test/${label}`).digest('hex'), 16);
 const payloadOf = (jwt: string) => JSON.parse(fromUtf8(fromB64url(jwt.split('.')[1]!)));
 const at = (iso: string): number => Date.parse(iso) / 1000;
+const isoNow = (): string => new Date(clock * 1000).toISOString().replace('.000Z', 'Z');
 
 const NOW = at('2026-11-05T09:00:00Z');
 const END_2026 = '2026-12-31T23:59:59Z';
@@ -840,6 +846,258 @@ describe('collecting', () => {
     }
     for (const t of texts) for (const n of NAMES) expect(t).not.toContain(n);
     expect(texts.filter((t) => t.includes(`"validUntil":"${END_2027}"`)).length).toBeGreaterThan(3);
+  });
+});
+
+describe('extending to a new place', () => {
+  const o = makeOffice('extend');
+  const HOMEWORK = 'homework-club:online';
+  const LIBRARY = 'library:reading-log';
+  const creds: Record<string, string> = {};
+  /** Every answer this block sees, for the names scan. */
+  const seen: string[] = [];
+  let entryJwt = '';
+  // The clock only goes forward here: a list signed at a withdrawal must not be from the future.
+  let t = NOW;
+  beforeEach(() => {
+    clock = t;
+  });
+
+  const did = (sk: PrivateKey): string => didKeyOfSecret(sk);
+  /** A collect by `sk` that extends what `heldSk` holds to it, with a guardian's proof if given. */
+  async function extendTo(sk: PrivateKey, heldSk: PrivateKey | null, guardianSk?: PrivateKey, over: Record<string, unknown> = {}) {
+    const body: Record<string, unknown> = { proof: collectProof({ subjectSk: sk, body: DID, at: clock }) };
+    if (heldSk !== null) body.extend = extendProof({ heldSk, body: DID, newSubject: did(sk), at: clock });
+    if (guardianSk !== undefined) body.guardian = guardianProof({ guardianSk, body: DID, newSubject: did(sk), at: clock });
+    const r = await o.pub('POST', '/collect', { ...body, ...over });
+    seen.push(r.text);
+    return r;
+  }
+  const collect = (sk: PrivateKey) => extendTo(sk, null);
+  const list = async (): Promise<string> => (await o.pub('GET', '/status/1')).text;
+  const state = () => JSON.parse(readFileSync(o.path, 'utf8'));
+  const indexOf = (jwt: string): number => Number(payloadOf(jwt).credentialStatus.statusListIndex);
+
+  test('the family and Lena pick up at the office', async () => {
+    await o.desk('POST', '/desk/roster', { rows: ROSTER });
+    const ids = ['HP-0042', 'HP-0043', 'HP-G-0042a', 'HP-0050'];
+    await o.desk('POST', '/desk/consent', { ids, consent: true });
+    const v = await o.desk('POST', '/desk/vouch', { ids });
+    const codes = Object.fromEntries(v.json.pickups.map((p: any) => [p.id, codeOf(p.url)]));
+    entryJwt = (await o.pub('GET', `/pickup/${codes['HP-0042']}`)).json.registryEntry;
+    for (const [name, id] of [['mia', 'HP-0042'], ['theo', 'HP-0043'], ['sam', 'HP-G-0042a'], ['lena', 'HP-0050']] as const) {
+      const code = codes[id]!;
+      const r = await o.pub('POST', `/pickup/${code}`, { proof: pickupProof({ subjectSk: holder(name), body: DID, code, at: clock }) });
+      expect(r.status).toBe(200);
+      creds[name] = r.json.credential;
+    }
+  });
+
+  test('a held key makes its vouch out to a new place: same claim and dates, a new place on the list', async () => {
+    const lena = holder('lena');
+    const hw = holder('lena', HOMEWORK);
+    const r = await extendTo(hw, lena);
+    expect(r.status).toBe(200);
+    expect(r.json.vouches).toHaveLength(1);
+    const v: string = r.json.vouches[0];
+    const was = payloadOf(creds.lena!);
+    const p = payloadOf(v);
+    expect(p.credentialSubject).toEqual({ id: did(hw), member: true });
+    expect([p.issuer, p.validFrom, p.validUntil]).toEqual([was.issuer, was.validFrom, was.validUntil]);
+    expect(indexOf(v)).not.toBe(indexOf(creds.lena!));
+    expect(admit(v, hw, entryJwt, await list(), 'member')).toMatchObject({ ok: true, subject: did(hw) });
+    // The held key's vouch is unchanged, and both are of the one row.
+    expect((await collect(lena)).json.vouches).toEqual([creds.lena]);
+    const rows = state().vouches.filter((x: any) => x.rosterId === 'HP-0050');
+    expect(rows.map((x: any) => x.subject).sort()).toEqual([did(lena), did(hw)].sort());
+    expect(rows.find((x: any) => x.subject === did(hw))).toMatchObject({ claim: 'member', validFrom: was.validFrom, issuedAt: isoNow(), validUntil: was.validUntil });
+    creds.lenaHomework = v;
+    // A plain collect by the new key now answers the same.
+    expect((await collect(hw)).json.vouches).toEqual([v]);
+  });
+
+  test('the binding: an extend naming key A issues nothing to key B', async () => {
+    const lena = holder('lena');
+    const a = holder('lena', LIBRARY);
+    const b = holder('mallory', LIBRARY);
+    const forA = extendProof({ heldSk: lena, body: DID, newSubject: did(a), at: clock });
+    const before = statSync(o.path).ino;
+    const r = await extendTo(b, null, undefined, { extend: forA });
+    expect([r.status, r.json]).toEqual([400, { error: 'wrong_nonce', detail: 'extend' }]);
+    expect(statSync(o.path).ino).toBe(before);
+    expect((await collect(b)).json).toEqual({ vouches: [] });
+    // Nor does a plain collect proof, or a pickup proof, stand in for an extend.
+    for (const extend of [collectProof({ subjectSk: lena, body: DID, at: clock }), pickupProof({ subjectSk: lena, body: DID, code: did(b), at: clock })]) {
+      const x = await extendTo(b, null, undefined, { extend });
+      expect([x.status, x.json.error]).toEqual([400, 'wrong_nonce']);
+    }
+    expect(state().vouches.some((x: any) => x.subject === did(b))).toBe(false);
+    // The extend for A works for A.
+    expect((await extendTo(a, null, undefined, { extend: forA })).json.vouches).toHaveLength(1);
+  });
+
+  test('a stale, wrong-audience, malformed, or same-key extend is refused', async () => {
+    const lena = holder('lena');
+    const n = holder('lena', 'new-place:one');
+    const ext = (over: { body?: string; nonce?: string; at?: number; sk?: PrivateKey } = {}) =>
+      signJwt({ aud: over.body ?? DID, nonce: over.nonce ?? extendNonce(did(n)), iat: over.at ?? clock }, over.sk ?? lena, 'openid4vci-proof+jwt');
+    expect(extendNonce(did(n))).toBe(`extend:${did(n)}`);
+    expect(extendProof({ heldSk: lena, body: DID, newSubject: did(n), at: clock })).toBe(ext());
+    const tries: [unknown, string, string | undefined][] = [
+      [ext({ at: clock - 301 }), 'stale', 'extend'],
+      [ext({ at: clock + 301 }), 'stale', 'extend'],
+      [ext({ body: 'did:web:other.example.org' }), 'wrong_audience', 'extend'],
+      [ext({ nonce: `extend:${did(n)} ` }), 'wrong_nonce', 'extend'],
+      [ext({ nonce: guardianNonce(did(n)) }), 'wrong_nonce', 'extend'],
+      [ext({ sk: n }), 'same_key', 'extend'],
+      ['not-a-jwt', 'bad_extend', undefined],
+      [null, 'bad_extend', undefined],
+      [signJwt({ aud: DID, nonce: extendNonce(did(n)), iat: clock }, lena), 'bad_extend', undefined],
+    ];
+    for (const [extend, error, detail] of tries) {
+      const r = await extendTo(n, null, undefined, { extend });
+      expect([r.status, r.json]).toEqual([400, { error, ...(detail !== undefined && { detail }) }]);
+    }
+    const lone = await extendTo(n, null, lena);
+    expect([lone.status, lone.json.error]).toEqual([400, 'bad_request']);
+    // The collect proof is checked first, as always.
+    const r = await extendTo(n, lena, undefined, { proof: collectProof({ subjectSk: n, body: DID, at: clock - 301 }) });
+    expect([r.status, r.json]).toEqual([400, { error: 'stale' }]);
+    expect(() => extendProof({ heldSk: lena, body: DID, newSubject: 'did:key:nope', at: clock })).toThrow();
+    expect(state().vouches.some((x: any) => x.subject === did(n))).toBe(false);
+  });
+
+  test('a held key the office does not vouch for adds nothing: the answer is the plain collect\'s', async () => {
+    const n = holder('stranger', HOMEWORK);
+    const plain = await collect(n);
+    expect(plain.json).toEqual({ vouches: [] });
+    const before = statSync(o.path).ino;
+    const r = await extendTo(n, holder('stranger'));
+    expect([r.status, r.text]).toEqual([200, plain.text]);
+    // Nor does a key whose vouches are all withdrawn: Theo's.
+    clock = t += 60;
+    await o.desk('POST', '/desk/withdraw', { ids: ['HP-0043'] });
+    const after = statSync(o.path).ino;
+    const theo = await extendTo(n, holder('theo'), holder('sam'));
+    expect([theo.status, theo.text]).toEqual([200, plain.text]);
+    expect(statSync(o.path).ino).toBe(after);
+    expect(after).not.toBe(before);
+    // A new key that holds vouches gets its own, and no more.
+    const hw = await extendTo(holder('lena', HOMEWORK), holder('stranger'));
+    expect(hw.json).toEqual({ vouches: [creds.lenaHomework] });
+  });
+
+  test('a new key already holding another row\'s vouch is refused subject_taken', async () => {
+    for (const taken of [holder('sam'), holder('mia')]) {
+      const before = statSync(o.path).ino;
+      const r = await extendTo(taken, holder('lena'));
+      expect([r.status, r.json.error]).toEqual([409, 'subject_taken']);
+      expect(statSync(o.path).ino).toBe(before);
+    }
+    // A withdrawn row's key is still that row's: Theo's key cannot take Lena's vouch.
+    const r = await extendTo(holder('theo'), holder('lena'));
+    expect([r.status, r.json.error]).toEqual([409, 'subject_taken']);
+  });
+
+  test('extending again issues nothing new: the same vouch, at the same place', async () => {
+    const hw = holder('lena', HOMEWORK);
+    const n = state().vouches.length;
+    const before = statSync(o.path).ino;
+    clock = t += 60;
+    const r = await extendTo(hw, holder('lena'));
+    expect(r.json).toEqual({ vouches: [creds.lenaHomework] });
+    expect(statSync(o.path).ino).toBe(before);
+    expect(state().vouches).toHaveLength(n);
+    // From the new key's own copy, back to a place already held, the same.
+    const back = await extendTo(holder('lena'), hw);
+    expect(back.json).toEqual({ vouches: [creds.lena] });
+    expect(state().vouches).toHaveLength(n);
+  });
+
+  test('a child\'s new place needs a guardian\'s proof', async () => {
+    const mia = holder('mia');
+    const hw = holder('mia', HOMEWORK);
+    const before = statSync(o.path).ino;
+    const none = await extendTo(hw, mia);
+    expect([none.status, none.json.error]).toEqual([403, 'guardian_required']);
+    // Not a guardian: Lena; the other guardian, Jo, holds no vouch; Theo is the child's brother.
+    for (const sk of [holder('lena'), holder('jo'), holder('theo')]) {
+      const r = await extendTo(hw, mia, sk);
+      expect([r.status, r.json.error]).toEqual([403, 'not_guardian']);
+    }
+    // Sam's proof must name this new key.
+    const other = guardianProof({ guardianSk: holder('sam'), body: DID, newSubject: did(holder('mia', LIBRARY)), at: clock });
+    const wrong = await extendTo(hw, mia, undefined, { guardian: other });
+    expect([wrong.status, wrong.json]).toEqual([400, { error: 'wrong_nonce', detail: 'guardian' }]);
+    const stale = guardianProof({ guardianSk: holder('sam'), body: DID, newSubject: did(hw), at: clock - 301 });
+    expect((await extendTo(hw, mia, undefined, { guardian: stale })).json).toEqual({ error: 'stale', detail: 'guardian' });
+    expect((await extendTo(hw, mia, undefined, { guardian: 'x' })).json).toEqual({ error: 'bad_guardian' });
+    expect(statSync(o.path).ino).toBe(before);
+
+    expect(guardianNonce(did(hw))).toBe(`guardian:${did(hw)}`);
+    const ok = await extendTo(hw, mia, holder('sam'));
+    expect(ok.status).toBe(200);
+    expect(ok.json.vouches).toHaveLength(1);
+    expect(payloadOf(ok.json.vouches[0]).credentialSubject).toEqual({ id: did(hw), member: true });
+    expect(admit(ok.json.vouches[0], hw, entryJwt, await list(), 'member')).toMatchObject({ ok: true });
+    creds.miaHomework = ok.json.vouches[0];
+    // An adult member needs none, and a guardian's proof given there is not asked about.
+    const lib = await extendTo(holder('lena', 'lena-only:x'), holder('lena'), holder('theo'));
+    expect(lib.status).toBe(200);
+    expect(lib.json.vouches).toHaveLength(1);
+  });
+
+  test('renewal reaches an extended key: vouched for 2027, it collects 2027\'s with no code', async () => {
+    clock = t += 86400;
+    await o.desk('POST', '/desk/vouch', { ids: ['HP-0042'], periodEnd: END_2027 });
+    const r = await collect(holder('mia', HOMEWORK));
+    expect(r.json.vouches).toHaveLength(2);
+    expect(r.json.vouches[1]).toBe(creds.miaHomework);
+    expect(payloadOf(r.json.vouches[0]).validUntil).toBe(END_2027);
+    // And a place extended to now gets both periods, with the guardian's word once.
+    const lib = holder('mia', LIBRARY);
+    const x = await extendTo(lib, holder('mia', HOMEWORK), holder('sam'));
+    expect(x.json.vouches.map((v: string) => payloadOf(v).validUntil)).toEqual([END_2027, END_2026]);
+  });
+
+  test('a row\'s vouches go to at most 16 keys', async () => {
+    const lena = holder('lena');
+    const keys = () => new Set(state().vouches.filter((x: any) => x.rosterId === 'HP-0050').map((x: any) => x.subject)).size;
+    for (let i = 0; keys() < ROW_MAX_PLACES; i++) expect((await extendTo(holder('lena', `place:${i}`), lena)).status).toBe(200);
+    expect(ROW_MAX_PLACES).toBe(16);
+    const r = await extendTo(holder('lena', 'place:one-too-many'), lena);
+    expect([r.status, r.json.error]).toEqual([409, 'too_many_places']);
+    // A key already among them still collects.
+    expect((await extendTo(holder('lena', HOMEWORK), lena)).json).toEqual({ vouches: [creds.lenaHomework] });
+  });
+
+  test('withdrawing the row withdraws every copy, and extends nothing after', async () => {
+    clock = t += 60;
+    const rows = state().vouches.filter((x: any) => x.rosterId === 'HP-0050');
+    expect(rows.length).toBe(ROW_MAX_PLACES);
+    const w = await o.desk('POST', '/desk/withdraw', { ids: ['HP-0050'] });
+    expect(w.json.withdrawn[0].statusIndexes.sort()).toEqual(rows.map((x: any) => x.statusIndex).sort());
+    const listJwt = await list();
+    for (const [jwt, sk] of [[creds.lena!, holder('lena')], [creds.lenaHomework!, holder('lena', HOMEWORK)]] as const) {
+      expect(admit(jwt, sk, entryJwt, listJwt, 'member')).toEqual({ ok: false, reason: 'withdrawn' });
+    }
+    const bits = decodeStatusList(payloadOf(listJwt).credentialSubject.encodedList);
+    for (const x of rows) expect(statusListBit(bits, x.statusIndex)).toBe(true);
+    for (const sk of [holder('lena'), holder('lena', HOMEWORK), holder('lena', 'place:0')]) expect((await collect(sk)).json).toEqual({ vouches: [] });
+    const r = await extendTo(holder('lena', 'after:x'), holder('lena', HOMEWORK));
+    expect(r.json).toEqual({ vouches: [] });
+    // Mia's copies, of another row, still pass.
+    expect(admit(creds.miaHomework!, holder('mia', HOMEWORK), entryJwt, listJwt, 'member')).toMatchObject({ ok: true });
+  });
+
+  test('names never leave: no answer to an extension, nor any vouch in one, carries a label, group or roster id', () => {
+    const texts: string[] = [];
+    for (const body of seen) {
+      texts.push(body);
+      for (const jwt of body.match(/eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+/g) ?? []) texts.push(JSON.stringify(payloadOf(jwt)));
+    }
+    for (const t of texts) for (const n of NAMES) expect(t).not.toContain(n);
+    expect(texts.length).toBeGreaterThan(40);
   });
 });
 
