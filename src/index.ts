@@ -216,3 +216,7 @@ export {
   verifyJwt,
   verifyJwtByKid,
 } from './bodies';
+
+// A person's key at one place: the per-site key, beside the bodies' relationship key (decision 11 of semantos-core's
+// CLAIMS-AND-REQUIREMENTS.md picks one). Pinned by test/fixtures/place_keys_kat.json, canonical here.
+export { originOf, SITE_KEY_VERSION, siteKeyInvoice, siteKeyOf } from './places';
