@@ -123,24 +123,38 @@ export const collectProof = (p: Omit<PickupProofInput, 'code'>): string => picku
  * new place's key carries a second proof, by a key the office already
  * vouches for, and the office makes out to the new key what that key holds:
  *
- *     POST /collect { proof, extend, guardian? }
+ *     POST /collect { proof, extend, cosign? }
  *
  * - `proof`: {@link collectProof}, by the new key.
  * - `extend`: {@link extendProof}, by the held key, naming the new key, which
  *   binds the two: an `extend` seen in passing makes out nothing to anyone
  *   else's key.
- * - `guardian`: {@link guardianProof}, by a key holding a live vouch of a
- *   guardian row whose `guardianOf` names the held key's row, also naming the
- *   new key. Required when the row is a child's, a member row some guardian
- *   row names, because a child's places are the guardian's choice.
+ * - `cosign`: a list of co-signatures (decision 17), each by a key standing in
+ *   a relation to the held key's row, with the nonce
+ *   `<relation>:<new key's did:key>` ({@link cosignNonce}). The one relation
+ *   is `guardian` ({@link guardianProof}): a key holding a live vouch of a
+ *   guardian row whose `guardianOf` names the row. One is required when the
+ *   row is a child's, a member row some guardian row names, because a child's
+ *   places are the guardian's choice. A co-signature not asked for is checked
+ *   and then not used.
  *
- * All three are pickup proofs, `openid4vci-proof+jwt` `{aud, nonce, iat}`,
- * each within {@link PRESENTATION_MAX_SKEW} of the office's clock.
+ * Every proof is a pickup proof, `openid4vci-proof+jwt` `{aud, nonce, iat}`,
+ * within {@link PRESENTATION_MAX_SKEW} of the office's clock.
  */
 export const extendNonce = (newSubject: string): string => `extend:${newSubject}`;
 
-/** The nonce of a guardian's consent to a child's new place. */
-export const guardianNonce = (newSubject: string): string => `guardian:${newSubject}`;
+/** The relations a co-signature at extension may stand in to the held key's row. */
+export const COSIGN_RELATIONS = ['guardian'] as const;
+export type CosignRelation = (typeof COSIGN_RELATIONS)[number];
+
+/** How many co-signatures one extension may carry. */
+export const COSIGN_MAX = 4;
+
+/** The nonce of a co-signature: its relation, and the new key it is for. */
+export const cosignNonce = (relation: CosignRelation, newSubject: string): string => `${relation}:${newSubject}`;
+
+/** The nonce of a guardian's consent to a child's new place: `guardian:<did:key>`. */
+export const guardianNonce = (newSubject: string): string => cosignNonce('guardian', newSubject);
 
 /** How many keys one row's live vouches may be made out to by extension, all told. */
 export const ROW_MAX_PLACES = 16;
@@ -173,25 +187,49 @@ export interface GuardianProofInput {
   at: number;
 }
 
-/** A guardian's word, to this body, that the child's vouches be made out to `newSubject` too. */
+/** A guardian's word, to this body, that the child's vouches be made out to `newSubject` too: an entry of `cosign`. */
 export function guardianProof(p: GuardianProofInput): string {
   publicKeyFromDidKey(p.newSubject);
   return pickupProof({ subjectSk: p.guardianSk, body: p.body, code: guardianNonce(p.newSubject), at: p.at });
 }
 
 /**
- * The did:key that signed a proof for this body and nonce, now. A refusal of
- * `extend` or `guardian` names the field in its detail, and a malformed one
- * is `bad_extend` or `bad_guardian`.
+ * The did:key that signed a proof for this body and one of these nonces, now,
+ * and the nonce. A refusal of `extend` or a `cosign` entry names it in its
+ * detail (`extend`, `cosign[0]`), and a malformed one is `bad_extend` or
+ * `bad_cosign`.
  */
-function proofSubject(proof: unknown, did: string, nonce: string, now: number, field: 'proof' | 'extend' | 'guardian' = 'proof'): string {
-  const refuse = (code: string) => (field === 'proof' ? new OfficeError(400, code) : new OfficeError(400, code, field));
+function readProof(
+  proof: unknown,
+  did: string,
+  nonces: readonly string[],
+  now: number,
+  field: 'proof' | 'extend' | 'cosign' = 'proof',
+  at: string = field,
+): { signer: string; nonce: string } {
+  const refuse = (code: string) => (field === 'proof' ? new OfficeError(400, code) : new OfficeError(400, code, at));
   const v = typeof proof === 'string' ? verifyJwtByKid(proof, PICKUP_PROOF_TYP) : null;
-  if (v === null || !Number.isSafeInteger(v.payload.iat)) throw new OfficeError(400, `bad_${field}`);
+  if (v === null || !Number.isSafeInteger(v.payload.iat)) throw field === 'cosign' ? refuse('bad_cosign') : new OfficeError(400, `bad_${field}`);
   if (v.payload.aud !== did) throw refuse('wrong_audience');
-  if (v.payload.nonce !== nonce) throw refuse('wrong_nonce');
+  if (!nonces.includes(v.payload.nonce)) throw refuse('wrong_nonce');
   if (Math.abs(now - v.payload.iat) > PRESENTATION_MAX_SKEW) throw refuse('stale');
-  return v.signer;
+  return { signer: v.signer, nonce: v.payload.nonce };
+}
+
+/** The did:key that signed a proof for this body and nonce, now. */
+const proofSubject = (proof: unknown, did: string, nonce: string, now: number, field: 'proof' | 'extend' = 'proof'): string =>
+  readProof(proof, did, [nonce], now, field).signer;
+
+/** Each co-signature's signer and relation, for the new key `subject`. */
+function readCosign(cosign: unknown, did: string, subject: string, now: number): { relation: CosignRelation; signer: string }[] {
+  if (!Array.isArray(cosign) || cosign.length === 0 || cosign.length > COSIGN_MAX) {
+    throw new OfficeError(400, 'bad_request', `cosign is a list of 1 to ${COSIGN_MAX} proofs`);
+  }
+  const nonces = COSIGN_RELATIONS.map((r) => cosignNonce(r, subject));
+  return cosign.map((proof, i) => {
+    const { signer, nonce } = readProof(proof, did, nonces, now, 'cosign', `cosign[${i}]`);
+    return { relation: COSIGN_RELATIONS[nonces.indexOf(nonce)]!, signer };
+  });
 }
 
 // ── shapes ───────────────────────────────────────────────────────────────────
@@ -588,16 +626,16 @@ export class Office {
    * here, issued now at a new place, with no code. A withdrawn row, or one
    * without consent, gets nothing new.
    *
-   * Extension: with `extend` (and, for a child, `guardian`), each live vouch
+   * Extension: with `extend` (and, for a child, a guardian's `cosign`), each live vouch
    * about the held key is first made out to the proof's key, see
    * {@link extendNonce}.
    */
-  collect(proof: unknown, extend?: unknown, guardian?: unknown): { vouches: string[] } {
+  collect(proof: unknown, extend?: unknown, cosign?: unknown): { vouches: string[] } {
     const s = this.store.load();
     const now = this.now();
     const subject = proofSubject(proof, s.did, COLLECT_NONCE, now);
-    if (extend === undefined && guardian !== undefined) throw new OfficeError(400, 'bad_request', 'guardian goes with extend');
-    const extended = extend !== undefined && this.extend(s, subject, extend, guardian, now);
+    if (extend === undefined && cosign !== undefined) throw new OfficeError(400, 'bad_request', 'cosign goes with extend');
+    const extended = extend !== undefined && this.extend(s, subject, extend, cosign, now);
     const renewed = this.renew(s, subject, now);
     const vouches = s.vouches
       .filter((v) => v.subject === subject && isLive(v, now))
@@ -618,10 +656,10 @@ export class Office {
    * a known one with nothing live. Withdrawal is by row, so withdrawing the
    * row withdraws every copy.
    */
-  private extend(s: OfficeState, subject: string, extend: unknown, guardian: unknown, now: number): boolean {
+  private extend(s: OfficeState, subject: string, extend: unknown, cosign: unknown, now: number): boolean {
     const held = proofSubject(extend, s.did, extendNonce(subject), now, 'extend');
     if (held === subject) throw new OfficeError(400, 'same_key', 'extend');
-    const guardianKey = guardian === undefined ? undefined : proofSubject(guardian, s.did, guardianNonce(subject), now, 'guardian');
+    const cosigners = cosign === undefined ? [] : readCosign(cosign, s.did, subject, now);
     const live = s.vouches.filter((v) => v.subject === held && isLive(v, now));
     // One key holds one row's vouches, so the held key's live vouches are all of one row.
     const rosterId = live[0]?.rosterId;
@@ -633,8 +671,11 @@ export class Office {
       throw new OfficeError(409, 'subject_taken', 'this key already holds a vouch for someone else');
     }
     if (this.isChild(s, row)) {
-      if (guardianKey === undefined) throw new OfficeError(403, 'guardian_required', 'a child\'s new place needs a guardian\'s proof');
-      if (!this.guards(s, guardianKey, rosterId, now)) throw new OfficeError(403, 'not_guardian', 'that key holds no live vouch as this child\'s guardian');
+      const guardians = cosigners.filter((c) => c.relation === 'guardian');
+      if (guardians.length === 0) throw new OfficeError(403, 'guardian_required', 'a child\'s new place needs a guardian\'s proof in cosign');
+      if (!guardians.some((g) => this.guards(s, g.signer, rosterId, now))) {
+        throw new OfficeError(403, 'not_guardian', 'no key in cosign holds a live vouch as this child\'s guardian');
+      }
     }
     const keys = new Set(s.vouches.filter((v) => v.rosterId === rosterId && v.withdrawnAt === undefined).map((v) => v.subject));
     let issued = false;

@@ -34,8 +34,10 @@ import {
   type OfficeHandlerOptions,
   PICKUP_MAX_SUBJECTS,
   PICKUP_TTL,
+  COSIGN_MAX,
   ROW_MAX_PLACES,
   collectProof,
+  cosignNonce,
   extendNonce,
   extendProof,
   fileStore,
@@ -868,7 +870,7 @@ describe('extending to a new place', () => {
   async function extendTo(sk: PrivateKey, heldSk: PrivateKey | null, guardianSk?: PrivateKey, over: Record<string, unknown> = {}) {
     const body: Record<string, unknown> = { proof: collectProof({ subjectSk: sk, body: DID, at: clock }) };
     if (heldSk !== null) body.extend = extendProof({ heldSk, body: DID, newSubject: did(sk), at: clock });
-    if (guardianSk !== undefined) body.guardian = guardianProof({ guardianSk, body: DID, newSubject: did(sk), at: clock });
+    if (guardianSk !== undefined) body.cosign = [guardianProof({ guardianSk, body: DID, newSubject: did(sk), at: clock })];
     const r = await o.pub('POST', '/collect', { ...body, ...over });
     seen.push(r.text);
     return r;
@@ -959,7 +961,7 @@ describe('extending to a new place', () => {
       expect([r.status, r.json]).toEqual([400, { error, ...(detail !== undefined && { detail }) }]);
     }
     const lone = await extendTo(n, null, lena);
-    expect([lone.status, lone.json.error]).toEqual([400, 'bad_request']);
+    expect([lone.status, lone.json]).toEqual([400, { error: 'bad_request', detail: 'cosign goes with extend' }]);
     // The collect proof is checked first, as always.
     const r = await extendTo(n, lena, undefined, { proof: collectProof({ subjectSk: n, body: DID, at: clock - 301 }) });
     expect([r.status, r.json]).toEqual([400, { error: 'stale' }]);
@@ -1027,15 +1029,34 @@ describe('extending to a new place', () => {
     }
     // Sam's proof must name this new key.
     const other = guardianProof({ guardianSk: holder('sam'), body: DID, newSubject: did(holder('mia', LIBRARY)), at: clock });
-    const wrong = await extendTo(hw, mia, undefined, { guardian: other });
-    expect([wrong.status, wrong.json]).toEqual([400, { error: 'wrong_nonce', detail: 'guardian' }]);
-    const stale = guardianProof({ guardianSk: holder('sam'), body: DID, newSubject: did(hw), at: clock - 301 });
-    expect((await extendTo(hw, mia, undefined, { guardian: stale })).json).toEqual({ error: 'stale', detail: 'guardian' });
-    expect((await extendTo(hw, mia, undefined, { guardian: 'x' })).json).toEqual({ error: 'bad_guardian' });
+    const wrong = await extendTo(hw, mia, undefined, { cosign: [other] });
+    expect([wrong.status, wrong.json]).toEqual([400, { error: 'wrong_nonce', detail: 'cosign[0]' }]);
+    const sam = (over: { at?: number; nonce?: string } = {}) =>
+      signJwt({ aud: DID, nonce: over.nonce ?? guardianNonce(did(hw)), iat: over.at ?? clock }, holder('sam'), 'openid4vci-proof+jwt');
+    expect(guardianProof({ guardianSk: holder('sam'), body: DID, newSubject: did(hw), at: clock })).toBe(sam());
+    expect(cosignNonce('guardian', did(hw))).toBe(guardianNonce(did(hw)));
+    const refused: [unknown, number, Record<string, string>][] = [
+      [[sam({ at: clock - 301 })], 400, { error: 'stale', detail: 'cosign[0]' }],
+      [[sam(), 'x'], 400, { error: 'bad_cosign', detail: 'cosign[1]' }],
+      // A relation the office does not know is a nonce it does not take.
+      [[sam({ nonce: `teacher:${did(hw)}` })], 400, { error: 'wrong_nonce', detail: 'cosign[0]' }],
+      [sam(), 400, { error: 'bad_request', detail: `cosign is a list of 1 to ${COSIGN_MAX} proofs` }],
+      [[], 400, { error: 'bad_request', detail: `cosign is a list of 1 to ${COSIGN_MAX} proofs` }],
+      [Array(COSIGN_MAX + 1).fill(sam()), 400, { error: 'bad_request', detail: `cosign is a list of 1 to ${COSIGN_MAX} proofs` }],
+    ];
+    for (const [cosign, status, json] of refused) {
+      const r = await extendTo(hw, mia, undefined, { cosign });
+      expect([r.status, r.json]).toEqual([status, json]);
+    }
+    // The field before decision 17 is refused by name, not ignored.
+    const old = await extendTo(hw, mia, undefined, { guardian: sam() });
+    expect([old.status, old.json]).toEqual([400, { error: 'bad_request', detail: 'a guardian\'s proof goes in cosign' }]);
     expect(statSync(o.path).ino).toBe(before);
 
     expect(guardianNonce(did(hw))).toBe(`guardian:${did(hw)}`);
-    const ok = await extendTo(hw, mia, holder('sam'));
+    // A list where any entry is a guardian's will do: Theo's proof is not one, Sam's is.
+    const theoSays = guardianProof({ guardianSk: holder('theo'), body: DID, newSubject: did(hw), at: clock });
+    const ok = await extendTo(hw, mia, undefined, { cosign: [theoSays, sam()] });
     expect(ok.status).toBe(200);
     expect(ok.json.vouches).toHaveLength(1);
     expect(payloadOf(ok.json.vouches[0]).credentialSubject).toEqual({ id: did(hw), member: true });

@@ -43,7 +43,7 @@ describe('collect known answers', () => {
       expect(fromUtf8(fromB64url(p.jwt.split('.')[1]))).toBe(JSON.stringify({ aud: KAT.body, nonce, iat: KAT.at }));
       expect(verifyJwtByKid(p.jwt, 'openid4vci-proof+jwt')?.signer).toBe(signer);
     }
-    expect(KAT.request.body).toEqual({ proof: KAT.proofs.collect.jwt, extend: KAT.proofs.extend.jwt, guardian: KAT.proofs.guardian.jwt });
+    expect(KAT.request.body).toEqual({ proof: KAT.proofs.collect.jwt, extend: KAT.proofs.extend.jwt, cosign: [KAT.proofs.guardian.jwt] });
   });
 
   test('an office takes the request: the child\'s vouch, made out to the new key', async () => {
@@ -76,8 +76,8 @@ describe('collect known answers', () => {
       expect((await call(`/pickup/${code}`, { proof: pickupProof({ subjectSk: sk, body: KAT.body, code, at: clock }) })).status).toBe(200);
     }
     clock = KAT.at;
-    const { guardian, ...adult } = KAT.request.body;
-    expect((await call('/collect', adult)).json).toEqual({ error: 'guardian_required', detail: 'a child\'s new place needs a guardian\'s proof' });
+    const { cosign, ...adult } = KAT.request.body;
+    expect((await call('/collect', adult)).json).toEqual({ error: 'guardian_required', detail: 'a child\'s new place needs a guardian\'s proof in cosign' });
     const r = await call(KAT.request.path, KAT.request.body);
     expect(r.status).toBe(200);
     expect(r.json.vouches).toHaveLength(1);
