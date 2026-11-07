@@ -69,15 +69,20 @@ a credential: no name, birthdate, student or membership number.
   child's 13th birthday would give the birthdate away, so `validUntil` must be
   one of the entry's published period ends (the end of the school year, the
   end of the season). The body re-vouches each period.
-- **One identifier per relationship.** The holder makes a key per app,
-  `relationshipKey(root, appId)`, a Plexus kdf-v1 child
-  (`relationship-<hash>:1:0`), so two apps comparing notes cannot link a
-  person. For a child the root is their family-plan seat (BitPiggy
+- **One identifier per place.** The holder makes a key per place,
+  `placeKeyOf(root, place)` (`src/places/`): BRC-42 to the root itself under
+  `2-admin plexus site-<place> 1`, where a place is a web site's origin
+  (`https://lessons.example`) or `app:<id>` for an app
+  (`app:kids-world:gem-island`). So two places comparing notes cannot link a
+  person, and at a web site it is the key the Plexus Auth approver signs in
+  with, so the key that signs in is the key the vouch names (semantos-core
+  `CLAIMS-AND-REQUIREMENTS.md`, decision 11, which replaced the earlier
+  `relationshipKey`). For a child the root is their family-plan seat (BitPiggy
   `family/`), so the guardian can recover it.
 - **Withdrawal.** The node signs the body's Bitstring Status List; apps fetch it
   whole, so the body never learns who checked whom. The same download says
   which nodes still count.
-- **Presentation.** The holder's relationship key signs the app's audience and
+- **Presentation.** The holder's place key signs the app's audience and
   one-time nonce over the vouch, as a JWT typed `vp+jwt` so a credential cannot
   pass for one; the app checks the presentation, the vouch, the registry entry,
   the withdrawal list and the delegations on it, the claim, the dates and the
@@ -224,6 +229,34 @@ id (the tests scan them).
   and dates) under the new node's signature. An unknown key gets `{vouches:
   []}`, the same as a key with nothing live, so the route cannot be used to
   ask whether a key is known. No label, group or roster id is in the answer.
+- **Extending to a new place** (semantos-core CLAIMS-AND-REQUIREMENTS.md
+  decision 12, tabletop F3; Todd's decision, 7 November 2026). A pickup names
+  the places chosen at the desk. For a place chosen later, the new place's
+  key collects with a second proof, by a key the office already vouches for:
+  `POST /collect {proof, extend, guardian?}`. `proof` is the ordinary collect
+  proof by the new key. `extend` is a proof by the held key with the nonce
+  `extend:<new key's did:key>`, which binds the two: an `extend` seen in
+  passing makes out nothing to another key. For a child's row (a member row
+  some guardian row's `guardianOf` names), `guardian` is required too: a
+  proof by a key holding a live `guardian_of_member` vouch of a current,
+  consented guardian row of that child, with the nonce `guardian:<new key's
+  did:key>`. All three are `openid4vci-proof+jwt` `{aud: body, nonce, iat}`,
+  within 300 s. The office makes out to the new key each live vouch about
+  the held key, the same row, claim, `validFrom` and `validUntil`, at a new
+  random place, then answers as a collect does for the new key, renewals
+  included. Asking again issues nothing new. A held key with nothing live,
+  or whose row has no consent, adds nothing, so the answer is the plain
+  collect's and an unknown key still cannot be told from a known one. The
+  refusals: 400 `bad_extend` or `bad_guardian` (malformed), `wrong_audience`,
+  `wrong_nonce`, `stale` (with `detail` naming `extend` or `guardian`),
+  `same_key` (the held key is the new key), `bad_request` (`guardian`
+  without `extend`); 403 `guardian_required`, `not_guardian`; 409
+  `subject_taken` (the new key holds another row's vouch, as at a pickup),
+  `too_many_places` (a row's live vouches go to at most 16 keys). The office
+  learns that the two keys are one holder, which it knew, and no site: the
+  request carries no origin. Withdrawal is by row, so it reaches every copy.
+  `extendProof` and `guardianProof` in `bodies/office/office.ts` make the
+  proofs, and test/fixtures/collect_kat.json pins their bytes.
 - **Renewal.** When the registrar vouches a row again for a later period
   (`/desk/vouch` with a later `periodEnd`), every key holding a live or
   lapsed vouch of that row collects the new period's vouch the next time it

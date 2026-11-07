@@ -16,6 +16,7 @@
     "bodies:demo": "bun bodies/demo.ts",
     "bodies:kat": "bun scripts/gen-bodies-kat.ts",
     "places:kat": "bun scripts/gen-place-keys-kat.ts",
+    "collect:kat": "bun scripts/gen-collect-kat.ts",
     "office": "bun bodies/office/cli.ts"
   },
   "dependencies": {

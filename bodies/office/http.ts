@@ -8,6 +8,9 @@
  *     GET  /pickup/:code             what the body will and will not say
  *     POST /pickup/:code {proof}     the vouch, about the key that signed the proof
  *     POST /collect {proof}          every live vouch about the key that signed the proof
+ *     POST /collect {proof, extend, guardian?}
+ *                                    the same, after making out to that key what a key the
+ *                                    office vouches for holds (a new place; office.ts, extendNonce)
  *
  * The registrar's desk:
  *
@@ -247,7 +250,8 @@ async function route(
   if (path === '/collect') {
     if (req.method === 'OPTIONS') return preflight('POST');
     only(['POST'], req);
-    return json(office.collect((await bodyOf(req)).proof));
+    const b = await bodyOf(req);
+    return json(office.collect(b.proof, b.extend, b.guardian));
   }
 
   throw new OfficeError(404, 'not_found');

@@ -88,7 +88,7 @@ export interface IssuedVouch {
   statusIndex: number;
   rosterId: string;
   claim: BodyClaim;
-  /** The holder's did:key for one relationship. */
+  /** The holder's did:key at one place. */
   subject: string;
   validFrom: string;
   issuedAt: string;
