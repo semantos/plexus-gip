@@ -8,7 +8,7 @@
  *     GET  /pickup/:code             what the body will and will not say
  *     POST /pickup/:code {proof}     the vouch, about the key that signed the proof
  *     POST /collect {proof}          every live vouch about the key that signed the proof
- *     POST /collect {proof, extend, guardian?}
+ *     POST /collect {proof, extend, cosign?}
  *                                    the same, after making out to that key what a key the
  *                                    office vouches for holds (a new place; office.ts, extendNonce)
  *
@@ -251,7 +251,8 @@ async function route(
     if (req.method === 'OPTIONS') return preflight('POST');
     only(['POST'], req);
     const b = await bodyOf(req);
-    return json(office.collect(b.proof, b.extend, b.guardian));
+    if ('guardian' in b) throw new OfficeError(400, 'bad_request', 'a guardian\'s proof goes in cosign');
+    return json(office.collect(b.proof, b.extend, b.cosign));
   }
 
   throw new OfficeError(404, 'not_found');
