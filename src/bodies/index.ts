@@ -18,7 +18,7 @@
  *
  * Standards: W3C VC Data Model 2.0 as a JWT with ES256K, Bitstring Status List
  * 1.0, did:web for the body, did:key for the member, with a different did:key
- * for each relationship ({@link relationshipKey}).
+ * for each place the member goes (`placeKeyOf` in `../places`).
  *
  * The body's anchor (its Plexus page-0) never signs a credential. It delegates
  * a signing node with `delegateSigner(anchorSk, nodePub, BODY_VOUCH_PURPOSE)`.
@@ -30,7 +30,6 @@
  *
  * One claim per credential, so a holder discloses one fact at a time.
  */
-import { createHash } from 'node:crypto';
 import type { PrivateKey, PublicKey } from '@bsv/sdk';
 import type { Association } from '../associations';
 import { readDelegation } from '../social/delegation';
@@ -95,9 +94,6 @@ export const DELEGATION_EVIDENCE_TYPE = 'SigningNodeDelegation';
 /** How far a presentation's `iat` may be from the verifier's clock, in seconds. */
 export const PRESENTATION_MAX_SKEW = 300;
 
-/** Plexus kdf-v1 domain flag for a relationship key (EDGE_CREATION). */
-export const EDGE_CREATION = 1;
-
 const isKind = (x: unknown): x is BodyKind => (BODY_KINDS as readonly unknown[]).includes(x);
 const isClaim = (x: unknown): x is BodyClaim => (BODY_CLAIMS as readonly unknown[]).includes(x);
 
@@ -140,20 +136,6 @@ function isPublicKeyHex(s: unknown): s is string {
   } catch {
     return false;
   }
-}
-
-/**
- * The holder's key for one relationship, so each relying party sees a
- * different subject and two of them cannot match a holder by key.
- *
- * Derived exactly as Plexus kdf-v1 derives a child: self-ECDH on the root with
- * the invoice `relationship-<first 16 hex of sha256(relyingPartyId)>:1:0`
- * (resource id, EDGE_CREATION domain, child index 0).
- */
-export function relationshipKey(holderRootSk: PrivateKey, relyingPartyId: string): PrivateKey {
-  if (relyingPartyId.length === 0) throw new WireError('bad_relying_party', 'empty id');
-  const tag = createHash('sha256').update(relyingPartyId, 'utf8').digest('hex').slice(0, 16);
-  return holderRootSk.deriveChild(holderRootSk.toPublicKey(), `relationship-${tag}:${EDGE_CREATION}:0`);
 }
 
 // ── delegation evidence ──────────────────────────────────────────────────────
@@ -321,7 +303,7 @@ export interface VouchInput {
   nodeSk: PrivateKey;
   /** The body's registry entry, as {@link readRegistryEntry} returns it. */
   entry: Pick<RegistryEntry, 'did' | 'claims' | 'periodEnds' | 'statusList'>;
-  /** The holder's did:key for this relationship. */
+  /** The holder's did:key at this place. */
   subject: string;
   claim: BodyClaim;
   /** The holder's bit in the body's withdrawal list. */
@@ -434,7 +416,7 @@ export function issueStatusList(nodeSk: PrivateKey, c: StatusListInput): string 
 
 export interface PresentInput {
   credentialJwt: string;
-  /** The holder's relationship key: the credential's subject. */
+  /** The holder's place key: the credential's subject. */
   subjectSk: PrivateKey;
   /** The relying party the presentation is for. */
   audience: string;

@@ -14,7 +14,6 @@ import {
   type BodyKind,
   type BodyRefusal,
   DELEGATION_EVIDENCE_TYPE,
-  EDGE_CREATION,
   type RegistryEntry,
   type VerifyPresentationOptions,
   delegateSigner,
@@ -26,8 +25,9 @@ import {
   issueStatusList,
   issueVouch,
   present,
+  appPlace,
+  placeKeyOf,
   readRegistryEntry,
-  relationshipKey,
   signJwt,
   verifyPresentation,
 } from '../src';
@@ -114,8 +114,8 @@ function rawList(b: Body, signer: PrivateKey, evidence: unknown): string {
 /** The gate holding one list for the body. */
 const holding = (b: Body, listJwt: string) => gate(b, { statusLists: { [b.statusList]: listJwt } });
 
-/** A holder's relationship key for the kids' world. */
-const holder = (label: string) => relationshipKey(key(`${label}/root`), RP);
+/** A holder's place key for the kids' world. */
+const holder = (label: string) => placeKeyOf(key(`${label}/root`), appPlace(RP));
 
 function vouch(b: Body, subjectSk: PrivateKey, over: Partial<Parameters<typeof issueVouch>[0]> = {}): string {
   return issueVouch({
@@ -460,20 +460,20 @@ describe('issuing refuses', () => {
 });
 
 describe('pairwise identifiers', () => {
-  test('one holder root gives a different subject to each relying party', () => {
+  test('one holder root gives a different subject at each place', () => {
     const root = key('mia/root');
-    const forWorld = relationshipKey(root, 'kids-world:gem-island');
-    const forOther = relationshipKey(root, 'homework-club:online');
-    expect(didKeyOfSecret(forWorld)).not.toBe(didKeyOfSecret(forOther));
+    const forWorld = placeKeyOf(root, appPlace('kids-world:gem-island'));
+    const forOther = placeKeyOf(root, appPlace('homework-club:online'));
+    const forSite = placeKeyOf(root, 'https://lessons.example');
+    expect(new Set([forWorld, forOther, forSite].map(didKeyOfSecret)).size).toBe(3);
     expect(didKeyOfSecret(forWorld)).not.toBe(didKeyOf(root.toPublicKey()));
-    expect(didKeyOfSecret(relationshipKey(root, 'kids-world:gem-island'))).toBe(didKeyOfSecret(forWorld));
+    expect(didKeyOfSecret(placeKeyOf(root, appPlace('kids-world:gem-island')))).toBe(didKeyOfSecret(forWorld));
   });
 
-  test('derived as Plexus kdf-v1 derives a child', () => {
+  test('derived as the place key is (decision 11): BRC-42 to the root itself, under the site invoice', () => {
     const root = key('mia/root');
-    const tag = createHash('sha256').update('kids-world:gem-island').digest('hex').slice(0, 16);
-    const expected = root.deriveChild(root.toPublicKey(), `relationship-${tag}:${EDGE_CREATION}:0`);
-    expect(relationshipKey(root, 'kids-world:gem-island').toHex()).toBe(expected.toHex());
+    const expected = root.deriveChild(root.toPublicKey(), '2-admin plexus site-app:kids-world:gem-island 1');
+    expect(placeKeyOf(root, appPlace('kids-world:gem-island')).toHex()).toBe(expected.toHex());
   });
 });
 

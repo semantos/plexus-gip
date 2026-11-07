@@ -3,7 +3,7 @@
  *
  * The registrar keeps a roster here, with names, and records each family's
  * consent. Vouching a row makes a one-time pickup code for the family to scan
- * at the office. Their app proves a key it made for one relationship and
+ * at the office. Their app proves a key it made for one place and
  * collects a vouch about that key: one claim, no name. Withdrawing a row sets
  * its bits in the body's withdrawal list, and the node signs the list again.
  * The list also carries the anchor's delegation of each node the body
@@ -94,7 +94,7 @@ export class OfficeError extends Error {
 // ── the holder's proof ───────────────────────────────────────────────────────
 
 export interface PickupProofInput {
-  /** The holder's relationship key: the subject of the vouch it collects. */
+  /** The holder's place key: the subject of the vouch it collects. */
   subjectSk: PrivateKey;
   /** The body's did:web. */
   body: string;

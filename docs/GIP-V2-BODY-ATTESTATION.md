@@ -69,15 +69,20 @@ a credential: no name, birthdate, student or membership number.
   child's 13th birthday would give the birthdate away, so `validUntil` must be
   one of the entry's published period ends (the end of the school year, the
   end of the season). The body re-vouches each period.
-- **One identifier per relationship.** The holder makes a key per app,
-  `relationshipKey(root, appId)`, a Plexus kdf-v1 child
-  (`relationship-<hash>:1:0`), so two apps comparing notes cannot link a
-  person. For a child the root is their family-plan seat (BitPiggy
+- **One identifier per place.** The holder makes a key per place,
+  `placeKeyOf(root, place)` (`src/places/`): BRC-42 to the root itself under
+  `2-admin plexus site-<place> 1`, where a place is a web site's origin
+  (`https://lessons.example`) or `app:<id>` for an app
+  (`app:kids-world:gem-island`). So two places comparing notes cannot link a
+  person, and at a web site it is the key the Plexus Auth approver signs in
+  with, so the key that signs in is the key the vouch names (semantos-core
+  `CLAIMS-AND-REQUIREMENTS.md`, decision 11, which replaced the earlier
+  `relationshipKey`). For a child the root is their family-plan seat (BitPiggy
   `family/`), so the guardian can recover it.
 - **Withdrawal.** The node signs the body's Bitstring Status List; apps fetch it
   whole, so the body never learns who checked whom. The same download says
   which nodes still count.
-- **Presentation.** The holder's relationship key signs the app's audience and
+- **Presentation.** The holder's place key signs the app's audience and
   one-time nonce over the vouch, as a JWT typed `vp+jwt` so a credential cannot
   pass for one; the app checks the presentation, the vouch, the registry entry,
   the withdrawal list and the delegations on it, the claim, the dates and the

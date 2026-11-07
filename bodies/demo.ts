@@ -32,7 +32,8 @@ import {
   present,
   readDelegation,
   readRegistryEntry,
-  relationshipKey,
+  appPlace,
+  placeKeyOf,
   verifyPresentation,
 } from '../src';
 
@@ -103,9 +104,9 @@ function runPilot(p: Pilot): void {
   console.log('  the delegation goes on the withdrawal list, not in each vouch');
 
   h('[3] Each wallet makes a key for this one platform');
-  const childSk = relationshipKey(key(`${p.did}/child-root`), GATE);
-  const parentSk = relationshipKey(key(`${p.did}/parent-root`), GATE);
-  const elsewhere = relationshipKey(key(`${p.did}/child-root`), 'homework-club:online');
+  const childSk = placeKeyOf(key(`${p.did}/child-root`), appPlace(GATE));
+  const parentSk = placeKeyOf(key(`${p.did}/parent-root`), appPlace(GATE));
+  const elsewhere = placeKeyOf(key(`${p.did}/child-root`), appPlace('homework-club:online'));
   console.log(`  child,  for ${GATE}   ${short(didKeyOfSecret(childSk))}`);
   console.log(`  parent, for ${GATE}   ${short(didKeyOfSecret(parentSk))}`);
   console.log(`  child,  for another platform   ${short(didKeyOfSecret(elsewhere))}   (a different key: no cross-platform match)`);

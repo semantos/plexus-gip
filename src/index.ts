@@ -152,7 +152,6 @@ export {
   BODY_VOUCH_PURPOSE,
   BODY_VOUCH_TYPE,
   DELEGATION_EVIDENCE_TYPE,
-  EDGE_CREATION,
   PRESENTATION_MAX_SKEW,
   BODY_VOUCH_OFFICE,
   REGISTRY_ENTRY_TYPE,
@@ -180,7 +179,6 @@ export {
   parseIsoSeconds,
   present,
   readRegistryEntry,
-  relationshipKey,
   verifyPresentation,
   vouchOfficeOf,
 } from './bodies';
@@ -217,6 +215,6 @@ export {
   verifyJwtByKid,
 } from './bodies';
 
-// A person's key at one place: the per-site key, beside the bodies' relationship key (decision 11 of semantos-core's
-// CLAIMS-AND-REQUIREMENTS.md picks one). Pinned by test/fixtures/place_keys_kat.json, canonical here.
-export { originOf, SITE_KEY_VERSION, siteKeyInvoice, siteKeyOf } from './places';
+// A person's key at one place, the one derivation for web sites and apps alike (semantos-core's
+// CLAIMS-AND-REQUIREMENTS.md decision 11). Pinned by test/fixtures/place_keys_kat.json, canonical here.
+export { appPlace, isAppId, isPlace, originOf, PLACE_KEY_VERSION, placeInvoice, placeKeyOf, siteKeyOf } from './places';

@@ -20,7 +20,8 @@ import {
   present,
   readDelegation,
   readRegistryEntry,
-  relationshipKey,
+  appPlace,
+  placeKeyOf,
   signJwt,
   statusListBit,
   verifyJwtByKid,
@@ -134,8 +135,8 @@ function makeOffice(name: string, claims: BodyClaim[] = ['member', 'guardian_of_
 
 const codeOf = (url: string): string => url.slice(url.lastIndexOf('/') + 1);
 
-/** A holder's relationship key for one app, from their wallet root. */
-const holder = (who: string, app = RP) => relationshipKey(key(`${who}/root`), app);
+/** A holder's place key for one app, from their wallet root. */
+const holder = (who: string, app = RP) => placeKeyOf(key(`${who}/root`), appPlace(app));
 
 function gate(entryJwt: string, listJwt: string, require: BodyClaim, nonce: string) {
   return {
