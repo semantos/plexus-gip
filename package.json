@@ -20,7 +20,7 @@
     "office": "bun bodies/office/cli.ts"
   },
   "dependencies": {
-    "@bsv/sdk": "^2.0.0"
+    "@bsv/sdk": "^4.1.0"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -5,7 +5,7 @@
     "": {
       "name": "gip-v2-kit",
       "dependencies": {
-        "@bsv/sdk": "^2.0.0",
+        "@bsv/sdk": "^4.1.0",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -14,7 +14,7 @@
     },
   },
   "packages": {
-    "@bsv/sdk": ["@bsv/sdk@2.4.2", "", {}, "sha512-UW1eC6YU+GdHBIQEBemuJo24K5S6rJBd6umNfkOpHR0ke5bgi58ymMrpX6Dm1cd4FYXsTDrbzyiKaH//LmJ7kw=="],
+    "@bsv/sdk": ["@bsv/sdk@4.1.1", "", {}, "sha512-s/ComOkwz/Z8pyC2JOJUqazSwNNNJIxgb+UuULfsuTcJKzw3DUoXYA5HLzN7Bj+nYILUGAqc1CSwSMF7g22ZSw=="],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
