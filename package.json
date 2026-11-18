@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Genealogical Identity Protocol v2 — self-contained runnable kit (Plexus identity + Semantos graph, carved from semantos-core)",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "scripts": {
     "walkthrough": "bun walkthrough.ts",
     "cli": "bun cli.ts",
