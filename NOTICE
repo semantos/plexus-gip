@@ -1,0 +1,9 @@
+plexus-gip
+Copyright 2026 Todd Price / semantos
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Versions before 2026-11-19 were under the Open BSV License Version 6 and keep
+those terms, including code ported from them before that date.
+
+@bsv/sdk, the one runtime dependency, is Apache-2.0 from version 4.1.0.
